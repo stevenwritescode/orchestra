@@ -1,0 +1,12 @@
+.env
+.linear-tokens.json
+node_modules/
+.claude/
+
+# Old root-level files (GitHub version)
+/orchestrator.mjs
+/Dockerfile
+/entrypoint.sh
+/docker-compose.yml
+/env.example
+/README.md

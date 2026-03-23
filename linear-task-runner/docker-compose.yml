@@ -1,0 +1,53 @@
+# Linear Task Runner — Docker Compose (GitLab Edition)
+#
+# Runs the orchestrator which polls Linear and spawns task containers.
+#
+# Note: The orchestrator needs access to the Docker socket to spawn
+# containers for each task. Each task container is ephemeral and isolated.
+#
+# Usage:
+#   cp .env.example .env   # fill in your keys
+#   docker compose up -d
+
+services:
+  orchestrator:
+    build: .
+    working_dir: /app
+    entrypoint: ["node", "/app/orchestrator.mjs"]
+    volumes:
+      - ./orchestrator.mjs:/app/orchestrator.mjs:ro
+      - ./linear-oauth.mjs:/app/linear-oauth.mjs:ro
+      - ./.linear-tokens.json:/app/.linear-tokens.json
+      - ./Dockerfile:/app/Dockerfile:ro
+      - ./entrypoint.sh:/app/entrypoint.sh:ro
+      # The orchestrator needs Docker access to spawn task containers
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - GITLAB_TOKEN=${GITLAB_TOKEN}
+      - GITLAB_URL=${GITLAB_URL:-https://gitlab.com}
+      - GITLAB_PROJECT_ID=${GITLAB_PROJECT_ID}
+      - REPO_URL=${REPO_URL}
+      - LOCAL_REPO_PATH=${LOCAL_REPO_PATH:-}
+      - LINEAR_API_KEY=${LINEAR_API_KEY:-}
+      - LINEAR_CLIENT_ID=${LINEAR_CLIENT_ID:-}
+      - LINEAR_CLIENT_SECRET=${LINEAR_CLIENT_SECRET:-}
+      - LINEAR_TOKEN_FILE=${LINEAR_TOKEN_FILE:-/app/.linear-tokens.json}
+      - LINEAR_LABEL=${LINEAR_LABEL:-autofix}
+      - LINEAR_STATUS=${LINEAR_STATUS:-Todo}
+      - CLAUDE_MODEL=${CLAUDE_MODEL:-sonnet}
+      - MAX_TURNS=${MAX_TURNS:-25}
+      - POLL_INTERVAL_MS=${POLL_INTERVAL_MS:-60000}
+      - TASK_TIMEOUT_MS=${TASK_TIMEOUT_MS:-600000}
+      - DOCKER_IMAGE=${DOCKER_IMAGE:-claude-task-runner}
+      # Backend Docker testing (optional)
+      - BACKEND_DOCKER_COMPOSE=${BACKEND_DOCKER_COMPOSE:-}
+      - BACKEND_SERVICE_NAME=${BACKEND_SERVICE_NAME:-backend}
+      - BACKEND_TEST_CMD=${BACKEND_TEST_CMD:-docker compose run --rm backend npm test}
+      - BACKEND_HEALTH_URL=${BACKEND_HEALTH_URL:-}
+      - BACKEND_HEALTH_TIMEOUT_MS=${BACKEND_HEALTH_TIMEOUT_MS:-30000}
+      - MAX_FIX_ITERATIONS=${MAX_FIX_ITERATIONS:-3}
+      # Live backend access (optional)
+      - BACKEND_LIVE_ACCESS=${BACKEND_LIVE_ACCESS:-false}
+      - BACKEND_PORT=${BACKEND_PORT:-3000}
+    restart: unless-stopped

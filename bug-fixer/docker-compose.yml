@@ -1,0 +1,92 @@
+# Bug Fixer Pipeline — Docker Compose
+#
+# Runs three services:
+#   1. api — Express server receiving bug reports
+#   2. worker — Polls queue and runs triage + fix with Claude Code
+#   3. webhook — Listens for GitLab MR review events and triggers revisions
+#
+# Usage:
+#   cp .env.example .env   # fill in your keys
+#   docker compose up -d
+
+services:
+  api:
+    image: node:22-slim
+    working_dir: /app
+    command: ["node", "api-server.mjs"]
+    volumes:
+      - ./api-server.mjs:/app/api-server.mjs:ro
+      - queue-data:/app/queue
+    ports:
+      - "${API_PORT:-3000}:3000"
+    environment:
+      - PORT=3000
+      - QUEUE_DIR=/app/queue
+    restart: unless-stopped
+
+  worker:
+    image: node:22-slim
+    working_dir: /app
+    command: ["bash", "/app/worker.sh"]
+    volumes:
+      - ./worker.sh:/app/worker.sh:ro
+      - queue-data:/app/queue
+      - repo-data:/app/repo
+      # Docker socket needed for backend testing (orchestrator-mediated)
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - GITLAB_TOKEN=${GITLAB_TOKEN}
+      - GITLAB_URL=${GITLAB_URL:-https://gitlab.com}
+      - GITLAB_PROJECT_ID=${GITLAB_PROJECT_ID}
+      - REPO_URL=${REPO_URL}
+      - LOCAL_REPO_PATH=${LOCAL_REPO_PATH:-}
+      - QUEUE_DIR=/app/queue
+      - REPO_DIR=/app/repo
+      - POLL_INTERVAL=${POLL_INTERVAL:-10}
+      - CLAUDE_MODEL=${CLAUDE_MODEL:-sonnet}
+      - MAX_TURNS=${MAX_TURNS:-25}
+      - TARGET_BRANCH=${TARGET_BRANCH:-main}
+      # Backend Docker testing (optional)
+      - BACKEND_DOCKER_COMPOSE=${BACKEND_DOCKER_COMPOSE:-}
+      - BACKEND_SERVICE_NAME=${BACKEND_SERVICE_NAME:-backend}
+      - BACKEND_TEST_CMD=${BACKEND_TEST_CMD:-docker compose run --rm backend npm test}
+      - BACKEND_HEALTH_URL=${BACKEND_HEALTH_URL:-}
+      - BACKEND_HEALTH_TIMEOUT_MS=${BACKEND_HEALTH_TIMEOUT_MS:-30000}
+      - MAX_FIX_ITERATIONS=${MAX_FIX_ITERATIONS:-3}
+      - BACKEND_LIVE_ACCESS=${BACKEND_LIVE_ACCESS:-false}
+      - BACKEND_PORT=${BACKEND_PORT:-3000}
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  webhook:
+    image: node:22-slim
+    working_dir: /app
+    command: ["node", "webhook-listener.mjs"]
+    volumes:
+      - ./webhook-listener.mjs:/app/webhook-listener.mjs:ro
+      - repo-data:/app/repo
+      - webhook-state:/app/state
+    ports:
+      - "${WEBHOOK_PORT:-3001}:3001"
+    environment:
+      - WEBHOOK_PORT=3001
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET}
+      - GITLAB_TOKEN=${GITLAB_TOKEN}
+      - GITLAB_URL=${GITLAB_URL:-https://gitlab.com}
+      - GITLAB_PROJECT_ID=${GITLAB_PROJECT_ID}
+      - REPO_DIR=/app/repo
+      - CLAUDE_MODEL=${CLAUDE_MODEL:-sonnet}
+      - MAX_TURNS=${MAX_TURNS:-15}
+      - MAX_REVISION_ROUNDS=${MAX_REVISION_ROUNDS:-3}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - STATE_DIR=/app/state
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  queue-data:
+  repo-data:
+  webhook-state:
