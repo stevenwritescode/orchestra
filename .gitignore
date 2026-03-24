@@ -9,4 +9,3 @@ node_modules/
 /entrypoint.sh
 /docker-compose.yml
 /env.example
-/README.md
