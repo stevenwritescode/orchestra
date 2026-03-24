@@ -36,6 +36,9 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - GIT_PROVIDER=${GIT_PROVIDER:-gitlab}
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - GITHUB_REPO=${GITHUB_REPO:-}
       - GITLAB_TOKEN=${GITLAB_TOKEN}
       - GITLAB_URL=${GITLAB_URL:-https://gitlab.com}
       - GITLAB_PROJECT_ID=${GITLAB_PROJECT_ID}
@@ -73,6 +76,9 @@ services:
     environment:
       - WEBHOOK_PORT=3001
       - WEBHOOK_SECRET=${WEBHOOK_SECRET}
+      - GIT_PROVIDER=${GIT_PROVIDER:-gitlab}
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - GITHUB_REPO=${GITHUB_REPO:-}
       - GITLAB_TOKEN=${GITLAB_TOKEN}
       - GITLAB_URL=${GITLAB_URL:-https://gitlab.com}
       - GITLAB_PROJECT_ID=${GITLAB_PROJECT_ID}

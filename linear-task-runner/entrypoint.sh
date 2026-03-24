@@ -92,41 +92,78 @@ git config --global user.name "claude-task-runner"
 git config --global user.email "claude-task-runner@automated"
 git config --global init.defaultBranch main
 
-# ─── Authenticate glab CLI ──────────────────────────────────────────────────
-if [ -n "$GITLAB_TOKEN" ]; then
-    # glab uses GITLAB_TOKEN env var directly for authentication.
-    # Set the default host for glab CLI.
-    GITLAB_HOST="${GITLAB_URL:-https://gitlab.com}"
-    GITLAB_HOST="${GITLAB_HOST#https://}"
-    GITLAB_HOST="${GITLAB_HOST#http://}"
+# ─── Authenticate git provider CLI ─────────────────────────────────────────
+GIT_PROVIDER="${GIT_PROVIDER:-gitlab}"
 
-    # Configure glab to use the token
-    mkdir -p /home/claude-runner/.config/glab-cli
-    cat > /home/claude-runner/.config/glab-cli/config.yml <<GLABEOF
+if [ "$GIT_PROVIDER" = "github" ]; then
+    if [ -n "$GITHUB_TOKEN" ]; then
+        export GH_TOKEN="$GITHUB_TOKEN"
+
+        GITHUB_HOST="${GITHUB_URL:-https://github.com}"
+        GITHUB_HOST="${GITHUB_HOST#https://}"
+        GITHUB_HOST="${GITHUB_HOST#http://}"
+
+        # Configure gh CLI
+        mkdir -p /home/claude-runner/.config/gh
+        cat > /home/claude-runner/.config/gh/hosts.yml <<GHEOF
+${GITHUB_HOST}:
+    oauth_token: ${GITHUB_TOKEN}
+    git_protocol: https
+GHEOF
+        chown -R claude-runner:claude-runner /home/claude-runner/.config
+
+        echo "[entrypoint] gh CLI configured for ${GITHUB_HOST}."
+    fi
+else
+    if [ -n "$GITLAB_TOKEN" ]; then
+        # glab uses GITLAB_TOKEN env var directly for authentication.
+        # Set the default host for glab CLI.
+        GITLAB_HOST="${GITLAB_URL:-https://gitlab.com}"
+        GITLAB_HOST="${GITLAB_HOST#https://}"
+        GITLAB_HOST="${GITLAB_HOST#http://}"
+
+        # Configure glab to use the token
+        mkdir -p /home/claude-runner/.config/glab-cli
+        cat > /home/claude-runner/.config/glab-cli/config.yml <<GLABEOF
 hosts:
   ${GITLAB_HOST}:
     token: ${GITLAB_TOKEN}
     api_host: ${GITLAB_HOST}
     git_protocol: https
 GLABEOF
-    chown -R claude-runner:claude-runner /home/claude-runner/.config
+        chown -R claude-runner:claude-runner /home/claude-runner/.config
 
-    echo "[entrypoint] glab CLI configured for ${GITLAB_HOST}."
+        echo "[entrypoint] glab CLI configured for ${GITLAB_HOST}."
+    fi
 fi
 
 # ─── Clone repo if not already present ───────────────────────────────────────
+# Build authenticated URL based on git provider
+get_authed_url() {
+    local url="$1"
+    if [ "$GIT_PROVIDER" = "github" ] && [ -n "$GITHUB_TOKEN" ]; then
+        echo "$url" | sed "s|https://|https://${GITHUB_TOKEN}@|"
+    elif [ "$GIT_PROVIDER" = "gitlab" ] && [ -n "$GITLAB_TOKEN" ]; then
+        echo "$url" | sed "s|https://|https://oauth2:${GITLAB_TOKEN}@|"
+    else
+        echo "$url"
+    fi
+}
+
 if [ "${SKIP_CLONE:-0}" = "1" ] && [ -d "/workspace/repo/.git" ]; then
     echo "[entrypoint] Using bind-mounted repo (SKIP_CLONE=1)."
 
     # Configure the remote to use authenticated URL for push
-    if [ -n "$REPO_URL" ] && [[ "$REPO_URL" == https://* ]] && [ -n "$GITLAB_TOKEN" ]; then
-        AUTHED_URL=$(echo "$REPO_URL" | sed "s|https://|https://oauth2:${GITLAB_TOKEN}@|")
-        git -C /workspace/repo remote set-url origin "$AUTHED_URL" 2>/dev/null || true
+    if [ -n "$REPO_URL" ] && [[ "$REPO_URL" == https://* ]]; then
+        AUTHED_URL=$(get_authed_url "$REPO_URL")
+        if [ "$AUTHED_URL" != "$REPO_URL" ]; then
+            git -C /workspace/repo remote set-url origin "$AUTHED_URL" 2>/dev/null || true
+        fi
     fi
 elif [ -n "$REPO_URL" ] && [ ! -d "/workspace/repo/.git" ]; then
     # Inject token into clone URL for HTTPS auth
-    if [[ "$REPO_URL" == https://* ]] && [ -n "$GITLAB_TOKEN" ]; then
-        AUTHED_URL=$(echo "$REPO_URL" | sed "s|https://|https://oauth2:${GITLAB_TOKEN}@|")
+    if [[ "$REPO_URL" == https://* ]]; then
+        AUTHED_URL=$(get_authed_url "$REPO_URL")
         git clone "$AUTHED_URL" /workspace/repo
     else
         git clone "$REPO_URL" /workspace/repo
@@ -151,4 +188,8 @@ fi
 chown -R claude-runner:claude-runner /workspace
 
 # ─── Drop to non-root and execute command ────────────────────────────────────
-exec su - claude-runner -c "cd /workspace/repo && ANTHROPIC_API_KEY='${ANTHROPIC_API_KEY}' GITLAB_TOKEN='${GITLAB_TOKEN}' $*"
+if [ "$GIT_PROVIDER" = "github" ]; then
+    exec su - claude-runner -c "cd /workspace/repo && ANTHROPIC_API_KEY='${ANTHROPIC_API_KEY}' GITHUB_TOKEN='${GITHUB_TOKEN}' GH_TOKEN='${GITHUB_TOKEN}' $*"
+else
+    exec su - claude-runner -c "cd /workspace/repo && ANTHROPIC_API_KEY='${ANTHROPIC_API_KEY}' GITLAB_TOKEN='${GITLAB_TOKEN}' $*"
+fi

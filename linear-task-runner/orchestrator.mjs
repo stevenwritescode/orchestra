@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // =============================================================================
-// Linear Task Runner — Orchestrator (GitLab Edition)
+// Linear Task Runner — Orchestrator (GitHub + GitLab Edition)
 //
 // Polls Linear for tasks matching a filter (e.g. label "autofix", status "Todo"),
 // then for each task:
@@ -57,6 +57,9 @@ try {
 const LINEAR_API_KEY = process.env.LINEAR_API_KEY || "";
 const LINEAR_AUTH_MODE = LINEAR_API_KEY ? "api-key" : "oauth";
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const GIT_PROVIDER = process.env.GIT_PROVIDER || "gitlab";
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN || "";
+const GITHUB_REPO = process.env.GITHUB_REPO || "";
 const GITLAB_TOKEN = process.env.GITLAB_TOKEN;
 const GITLAB_URL = process.env.GITLAB_URL || "https://gitlab.com";
 const GITLAB_PROJECT_ID = process.env.GITLAB_PROJECT_ID;
@@ -97,8 +100,16 @@ const STAGING_DIR = process.env.STAGING_DIR || "/tmp/task-staging";
 const LINEAR_LABEL = process.env.LINEAR_LABEL || "autofix";
 const LINEAR_STATUS = process.env.LINEAR_STATUS || "Todo";
 
-if (!ANTHROPIC_API_KEY || !GITLAB_TOKEN || !GITLAB_PROJECT_ID) {
-  console.error("Missing required env vars: ANTHROPIC_API_KEY, GITLAB_TOKEN, GITLAB_PROJECT_ID");
+if (!ANTHROPIC_API_KEY) {
+  console.error("Missing required env var: ANTHROPIC_API_KEY");
+  process.exit(1);
+}
+if (GIT_PROVIDER === "github" && (!GITHUB_TOKEN || !GITHUB_REPO)) {
+  console.error("Missing required env vars for GitHub: GITHUB_TOKEN, GITHUB_REPO");
+  process.exit(1);
+}
+if (GIT_PROVIDER === "gitlab" && (!GITLAB_TOKEN || !GITLAB_PROJECT_ID)) {
+  console.error("Missing required env vars for GitLab: GITLAB_TOKEN, GITLAB_PROJECT_ID");
   process.exit(1);
 }
 if (!LINEAR_API_KEY && !getLinearToken) {
@@ -224,37 +235,55 @@ async function addIssueComment(issueId, body) {
   `, { issueId, body });
 }
 
-// ─── GitLab API helper ──────────────────────────────────────────────────────
-async function gitlabApi(method, path, body = null) {
-  const encodedProject = encodeURIComponent(GITLAB_PROJECT_ID);
-  const url = `${GITLAB_URL}/api/v4/projects/${encodedProject}${path}`;
+// ─── Git Provider API helper ────────────────────────────────────────────────
+async function gitApi(method, path, body = null) {
+  let url;
+  let headers;
 
-  const options = {
-    method,
-    headers: {
+  if (GIT_PROVIDER === "github") {
+    url = `https://api.github.com/repos/${GITHUB_REPO}${path}`;
+    headers = {
+      "Authorization": `token ${GITHUB_TOKEN}`,
+      "Accept": "application/vnd.github.v3+json",
+      "Content-Type": "application/json",
+    };
+  } else {
+    const encodedProject = encodeURIComponent(GITLAB_PROJECT_ID);
+    url = `${GITLAB_URL}/api/v4/projects/${encodedProject}${path}`;
+    headers = {
       "PRIVATE-TOKEN": GITLAB_TOKEN,
       "Content-Type": "application/json",
-    },
-  };
+    };
+  }
+
+  const options = { method, headers };
   if (body) options.body = JSON.stringify(body);
 
   const res = await fetch(url, options);
   const text = await res.text();
 
   if (!res.ok) {
-    throw new Error(`GitLab API ${method} ${path}: ${res.status} ${text}`);
+    const providerName = GIT_PROVIDER === "github" ? "GitHub" : "GitLab";
+    throw new Error(`${providerName} API ${method} ${path}: ${res.status} ${text}`);
   }
 
   return JSON.parse(text);
 }
 
-// ─── Check if an MR exists for this task ────────────────────────────────────
+// ─── Check if an MR/PR exists for this task ─────────────────────────────────
 async function checkForMR(taskIdentifier) {
   try {
-    const mrs = await gitlabApi("GET",
-      `/merge_requests?state=opened&search=${encodeURIComponent(taskIdentifier)}&per_page=1`
-    );
-    return mrs.length > 0 ? mrs[0] : null;
+    if (GIT_PROVIDER === "github") {
+      const prs = await gitApi("GET", `/pulls?state=open`);
+      const match = prs.find((pr) => pr.title.includes(taskIdentifier));
+      if (!match) return null;
+      return { web_url: match.html_url, title: match.title, number: match.number };
+    } else {
+      const mrs = await gitApi("GET",
+        `/merge_requests?state=opened&search=${encodeURIComponent(taskIdentifier)}&per_page=1`
+      );
+      return mrs.length > 0 ? mrs[0] : null;
+    }
   } catch {
     return null;
   }
@@ -272,7 +301,7 @@ function prepareStagingCopy(taskIdentifier) {
   // Use git clone --local for efficiency (hardlinks where possible)
   execSync(`git clone --local "${LOCAL_REPO_PATH}" "${stagingPath}/repo"`, { stdio: "pipe" });
 
-  // Ensure the remote points to the actual GitLab remote, not the local path
+  // Ensure the remote points to the actual remote, not the local path
   if (REPO_URL) {
     execSync(`git -C "${stagingPath}/repo" remote set-url origin "${REPO_URL}"`, { stdio: "pipe" });
   }
@@ -323,6 +352,15 @@ The orchestrator will build and test the backend container for you after you com
 Focus on making code changes, running any non-Docker tests, and committing.`;
     }
 
+    const cliName = GIT_PROVIDER === "github" ? "gh" : "glab";
+    const mrTerm = GIT_PROVIDER === "github" ? "pull request" : "merge request";
+    const draftTitle = GIT_PROVIDER === "github"
+      ? `${task.identifier}: ${task.title}`
+      : `Draft: ${task.identifier}: ${task.title}`;
+    const cliExample = GIT_PROVIDER === "github"
+      ? `gh pr create --draft --title "${draftTitle}" --body "..." --head "${branchName}" --base main`
+      : `glab mr create --draft --title "${draftTitle}" --description "..." --source-branch "${branchName}" --target-branch main`;
+
     const prompt = `You are an autonomous developer working on a task from the project tracker.
 
 Task: ${task.title}
@@ -340,15 +378,15 @@ Instructions:
 3. Write or update tests if appropriate
 4. Run the existing test suite to verify nothing is broken
 5. If tests pass, create a branch named "${branchName}", commit your changes, and push
-6. Create a draft merge request using glab CLI with a clear description linking back to ${task.identifier}
+6. Create a draft ${mrTerm} using ${cliName} CLI with a clear description linking back to ${task.identifier}
 7. If you cannot complete the task, write a detailed explanation of what blockers you hit
 ${backendPromptSection}
 
 Commit message format: ${task.identifier}: [short description]
-MR title format: Draft: ${task.identifier}: ${task.title}
+${mrTerm.charAt(0).toUpperCase() + mrTerm.slice(1)} title format: ${draftTitle}
 
-Use glab CLI to create the MR. Link it to the task by including "${task.url}" in the MR body.
-Example: glab mr create --draft --title "Draft: ${task.identifier}: ${task.title}" --description "..." --source-branch "${branchName}" --target-branch main`;
+Use ${cliName} CLI to create the ${mrTerm}. Link it to the task by including "${task.url}" in the ${mrTerm} body.
+Example: ${cliExample}`;
 
     const escapedPrompt = prompt.replace(/'/g, "'\\''");
 
@@ -358,12 +396,25 @@ Example: glab mr create --draft --title "Draft: ${task.identifier}: ${task.title
       "--name", containerName,
       "--cap-add=NET_ADMIN",
       "-e", `ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}`,
-      "-e", `GITLAB_TOKEN=${GITLAB_TOKEN}`,
-      "-e", `GITLAB_URL=${GITLAB_URL}`,
-      "-e", `GITLAB_PROJECT_ID=${GITLAB_PROJECT_ID}`,
+      "-e", `GIT_PROVIDER=${GIT_PROVIDER}`,
       "--memory=4g",
       "--cpus=2",
     ];
+
+    // Provider-specific env vars for the container
+    if (GIT_PROVIDER === "github") {
+      dockerArgs.push(
+        "-e", `GITHUB_TOKEN=${GITHUB_TOKEN}`,
+        "-e", `GH_TOKEN=${GITHUB_TOKEN}`,
+        "-e", `GITHUB_REPO=${GITHUB_REPO}`,
+      );
+    } else {
+      dockerArgs.push(
+        "-e", `GITLAB_TOKEN=${GITLAB_TOKEN}`,
+        "-e", `GITLAB_URL=${GITLAB_URL}`,
+        "-e", `GITLAB_PROJECT_ID=${GITLAB_PROJECT_ID}`,
+      );
+    }
 
     // Decide how the repo gets into the container
     if (LOCAL_REPO_PATH) {
@@ -795,12 +846,17 @@ function log(msg) {
 }
 
 async function main() {
-  log("Linear Task Runner started (GitLab edition)");
+  log(`Linear Task Runner started (${GIT_PROVIDER === "github" ? "GitHub" : "GitLab"} edition)`);
+  log(`Git provider: ${GIT_PROVIDER}`);
+  if (GIT_PROVIDER === "github") {
+    log(`GitHub: repo=${GITHUB_REPO}`);
+  } else {
+    log(`GitLab: ${GITLAB_URL} | Project: ${GITLAB_PROJECT_ID}`);
+  }
   log(`Linear auth: ${LINEAR_AUTH_MODE === "api-key" ? "API key" : "OAuth (auto-refreshing)"}`);
   log(`Polling every ${POLL_INTERVAL_MS / 1000}s for issues with label="${LINEAR_LABEL}" status="${LINEAR_STATUS}"`);
   log(`Model: ${CLAUDE_MODEL} | Max turns: ${MAX_TURNS} | Timeout: ${TASK_TIMEOUT_MS / 1000}s`);
   log(`Repo: ${LOCAL_REPO_PATH ? `LOCAL ${LOCAL_REPO_PATH}` : REPO_URL}`);
-  log(`GitLab: ${GITLAB_URL} | Project: ${GITLAB_PROJECT_ID}`);
   if (BACKEND_DOCKER_COMPOSE) {
     log(`Backend testing: ${BACKEND_DOCKER_COMPOSE} (service: ${BACKEND_SERVICE_NAME})`);
     if (BACKEND_LIVE_ACCESS) {

@@ -36,6 +36,14 @@ RUN ARCH=$(dpkg --print-architecture) \
     && dpkg -i /tmp/glab.deb \
     && rm /tmp/glab.deb
 
+# Install gh CLI (GitHub CLI)
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+       | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg 2>/dev/null \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+       > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update -qq && apt-get install -y -qq gh \
+    && rm -rf /var/lib/apt/lists/*
+
 # Create non-root user for Claude Code
 RUN useradd -m -s /bin/bash claude-runner
 
