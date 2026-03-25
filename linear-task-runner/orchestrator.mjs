@@ -160,9 +160,10 @@ const REVIEW_WAIT_TIMEOUT_MS = parseInt(process.env.REVIEW_WAIT_TIMEOUT_MS || "3
 // Staging directory for extracting agent changes before backend testing
 const STAGING_DIR = process.env.STAGING_DIR || "/tmp/task-staging";
 
-// Linear filter
+// Linear filter — LINEAR_STATUS supports comma-separated values (e.g. "Backlog,In Progress")
 const LINEAR_LABEL = process.env.LINEAR_LABEL || "autofix";
-const LINEAR_STATUS = process.env.LINEAR_STATUS || "Todo";
+const LINEAR_STATUS_RAW = process.env.LINEAR_STATUS || "Todo";
+const LINEAR_STATUSES = LINEAR_STATUS_RAW.split(",").map((s) => s.trim()).filter(Boolean);
 
 if (!ANTHROPIC_API_KEY) {
   console.error("No Anthropic credentials found. Either:");
@@ -234,11 +235,11 @@ async function linearQuery(query, variables = {}) {
 // ─── Fetch tasks from Linear ────────────────────────────────────────────────
 async function fetchPendingTasks() {
   const data = await linearQuery(`
-    query PendingTasks($labelName: String!, $statusName: String!) {
+    query PendingTasks($labelName: String!, $statusNames: [String!]!) {
       issues(
         filter: {
           labels: { name: { eq: $labelName } }
-          state: { name: { eq: $statusName } }
+          state: { name: { in: $statusNames } }
         }
         first: 10
         orderBy: updatedAt
@@ -254,6 +255,7 @@ async function fetchPendingTasks() {
           project { name }
           team { key }
           url
+          state { name }
           comments {
             nodes {
               body
@@ -273,7 +275,7 @@ async function fetchPendingTasks() {
     }
   `, {
     labelName: LINEAR_LABEL,
-    statusName: LINEAR_STATUS,
+    statusNames: LINEAR_STATUSES,
   });
 
   return data.issues.nodes;
@@ -1233,8 +1235,13 @@ async function processTask(task) {
   }
   log(`[${task.identifier}] Linear URL: ${task.url}`);
 
-  log(`[${task.identifier}] Updating Linear status → In Progress`);
-  await updateIssueStatus(task.id, "In Progress");
+  const currentStatus = task.state?.name;
+  if (currentStatus !== "In Progress") {
+    log(`[${task.identifier}] Updating Linear status → In Progress`);
+    await updateIssueStatus(task.id, "In Progress");
+  } else {
+    log(`[${task.identifier}] Already In Progress — skipping status update`);
+  }
   await addIssueComment(task.id, `🤖 Automated task runner is working on this.\n\nModel: ${CLAUDE_MODEL}\nMax turns: ${MAX_TURNS}${BACKEND_DOCKER_COMPOSE ? `\nBackend testing: enabled (${BACKEND_SERVICE_NAME})` : ""}`);
 
   let lastStagingPath = null;
@@ -1403,7 +1410,7 @@ async function main() {
   }
   log(`Claude auth: ${ANTHROPIC_AUTH_MODE === "oauth" ? "OAuth (from Claude Code login)" : "API key"}`);
   log(`Linear auth: ${LINEAR_AUTH_MODE === "api-key" ? "API key" : "OAuth (auto-refreshing)"}`);
-  log(`Polling every ${POLL_INTERVAL_MS / 1000}s for issues with label="${LINEAR_LABEL}" status="${LINEAR_STATUS}"`);
+  log(`Polling every ${POLL_INTERVAL_MS / 1000}s for issues with label="${LINEAR_LABEL}" status="${LINEAR_STATUSES.join(", ")}"`);
   log(`Model: ${CLAUDE_MODEL} | Max turns: ${MAX_TURNS} | Timeout: ${TASK_TIMEOUT_MS / 1000}s`);
   log(`Repo: ${LOCAL_REPO_PATH ? `LOCAL ${LOCAL_REPO_PATH}` : REPO_URL}`);
   if (BACKEND_DOCKER_COMPOSE) {
@@ -1434,7 +1441,7 @@ async function main() {
   while (true) {
     pollCount++;
     try {
-      log(`Poll #${pollCount}: checking Linear for label="${LINEAR_LABEL}" status="${LINEAR_STATUS}"...`);
+      log(`Poll #${pollCount}: checking Linear for label="${LINEAR_LABEL}" status="${LINEAR_STATUSES.join(", ")}"...`);
 
       // Debug: show all issues with this label regardless of status
       if (pollCount === 1 || pollCount % 10 === 0) {
@@ -1462,7 +1469,7 @@ async function main() {
           } else {
             log(`Poll #${pollCount}: all issues with label "${LINEAR_LABEL}":`);
             for (const issue of allIssues) {
-              const match = issue.state.name === LINEAR_STATUS ? " ← MATCH" : "";
+              const match = LINEAR_STATUSES.includes(issue.state.name) ? " ← MATCH" : "";
               log(`  → ${issue.identifier}: ${issue.title} [status: "${issue.state.name}"]${match}`);
             }
           }
@@ -1474,7 +1481,7 @@ async function main() {
       const tasks = await fetchPendingTasks();
 
       if (tasks.length === 0) {
-        log(`Poll #${pollCount}: no tasks matching label="${LINEAR_LABEL}" AND status="${LINEAR_STATUS}". Next poll in ${POLL_INTERVAL_MS / 1000}s.`);
+        log(`Poll #${pollCount}: no tasks matching label="${LINEAR_LABEL}" AND status="${LINEAR_STATUSES.join(", ")}". Next poll in ${POLL_INTERVAL_MS / 1000}s.`);
       } else {
         log(`Poll #${pollCount}: found ${tasks.length} task(s):`);
         for (const task of tasks) {
