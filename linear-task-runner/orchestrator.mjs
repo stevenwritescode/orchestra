@@ -157,6 +157,9 @@ const REVIEW_POLL_INTERVAL_MS = parseInt(process.env.REVIEW_POLL_INTERVAL_MS || 
 const MAX_REVIEW_ROUNDS = parseInt(process.env.MAX_REVIEW_ROUNDS || "5");
 const REVIEW_WAIT_TIMEOUT_MS = parseInt(process.env.REVIEW_WAIT_TIMEOUT_MS || "3600000"); // 1 hour
 
+// Concurrency: how many tasks to work on simultaneously
+const MAX_CONCURRENT_TASKS = parseInt(process.env.MAX_CONCURRENT_TASKS || "3");
+
 // Staging directory for extracting agent changes before backend testing
 const STAGING_DIR = process.env.STAGING_DIR || "/tmp/task-staging";
 
@@ -1440,12 +1443,16 @@ async function main() {
     process.exit(1);
   }
 
+  // Track active tasks so we don't pick them up again
+  const activeTasks = new Map(); // identifier → Promise
+
   // Poll loop
   let pollCount = 0;
   while (true) {
     pollCount++;
     try {
-      log(`Poll #${pollCount}: checking Linear for label="${LINEAR_LABEL}" status="${LINEAR_STATUSES.join(", ")}"...`);
+      const activeCount = activeTasks.size;
+      log(`Poll #${pollCount}: checking Linear (${activeCount}/${MAX_CONCURRENT_TASKS} tasks active)...`);
 
       // Debug: show all issues with this label regardless of status
       if (pollCount === 1 || pollCount % 10 === 0) {
@@ -1473,8 +1480,9 @@ async function main() {
           } else {
             log(`Poll #${pollCount}: all issues with label "${LINEAR_LABEL}":`);
             for (const issue of allIssues) {
+              const active = activeTasks.has(issue.identifier) ? " ← ACTIVE" : "";
               const match = LINEAR_STATUSES.includes(issue.state.name) ? " ← MATCH" : "";
-              log(`  → ${issue.identifier}: ${issue.title} [status: "${issue.state.name}"]${match}`);
+              log(`  → ${issue.identifier}: ${issue.title} [status: "${issue.state.name}"]${match}${active}`);
             }
           }
         } catch (err) {
@@ -1484,18 +1492,34 @@ async function main() {
 
       const tasks = await fetchPendingTasks();
 
-      if (tasks.length === 0) {
+      // Filter out tasks we're already working on
+      const newTasks = tasks.filter((t) => !activeTasks.has(t.identifier));
+      // Respect concurrency limit
+      const slots = MAX_CONCURRENT_TASKS - activeTasks.size;
+
+      if (newTasks.length === 0 && tasks.length === 0) {
         log(`Poll #${pollCount}: no tasks matching label="${LINEAR_LABEL}" AND status="${LINEAR_STATUSES.join(", ")}". Next poll in ${POLL_INTERVAL_MS / 1000}s.`);
+      } else if (newTasks.length === 0) {
+        log(`Poll #${pollCount}: ${tasks.length} task(s) found but all already active. Next poll in ${POLL_INTERVAL_MS / 1000}s.`);
+      } else if (slots <= 0) {
+        log(`Poll #${pollCount}: ${newTasks.length} new task(s) but at concurrency limit (${MAX_CONCURRENT_TASKS}). Next poll in ${POLL_INTERVAL_MS / 1000}s.`);
       } else {
-        log(`Poll #${pollCount}: found ${tasks.length} task(s):`);
-        for (const task of tasks) {
+        const toStart = newTasks.slice(0, slots);
+        log(`Poll #${pollCount}: starting ${toStart.length} new task(s) (${slots} slots available):`);
+        for (const task of toStart) {
           const commentCount = task.comments?.nodes?.length || 0;
           log(`  → ${task.identifier}: ${task.title} (priority: ${task.priority || "none"}, comments: ${commentCount})`);
         }
 
-        for (const task of tasks) {
-          await processTask(task);
-          await new Promise((r) => setTimeout(r, 5000));
+        // Launch tasks concurrently — each runs in the background
+        for (const task of toStart) {
+          const taskPromise = processTask(task)
+            .catch((err) => log(`[${task.identifier}] Unhandled error: ${err.message}`))
+            .finally(() => {
+              activeTasks.delete(task.identifier);
+              log(`[${task.identifier}] Task finished. Active: ${activeTasks.size}/${MAX_CONCURRENT_TASKS}`);
+            });
+          activeTasks.set(task.identifier, taskPromise);
         }
       }
     } catch (err) {
