@@ -465,13 +465,15 @@ Instructions:
    git checkout -b ${branchName}
    This must be done BEFORE any other work so nothing is lost.
 2. Read the codebase to understand the relevant code
-3. Implement the requested changes
-4. Commit frequently as you make progress (don't wait until the end)
-5. Write or update tests if appropriate
-6. Run the existing test suite to verify nothing is broken
-7. Push the branch: git push -u origin ${branchName}
-8. Create a draft ${mrTerm} using ${cliName} CLI with a clear description linking back to ${task.identifier}
-9. If you cannot complete the task, still commit and push whatever progress you've made with a WIP commit
+3. Implement the requested changes following this save pattern:
+   - After every meaningful change (new function, fixed bug, added test, etc.), commit AND push:
+     git add -A && git commit -m "${task.identifier}: [what you just did]" && git push -u origin ${branchName}
+   - Do NOT batch up changes — commit and push after each logical step
+   - This ensures no work is lost if the session ends unexpectedly
+4. Write or update tests if appropriate
+5. Run the existing test suite to verify nothing is broken
+6. After all changes are committed and pushed, create a draft ${mrTerm} using ${cliName} CLI with a clear description linking back to ${task.identifier}
+7. If you cannot complete the task, still commit and push whatever progress you've made with a WIP commit
 ${backendPromptSection}
 
 Commit message format: ${task.identifier}: [short description]
