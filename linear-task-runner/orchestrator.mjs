@@ -321,8 +321,8 @@ function prepareStagingCopy(taskIdentifier) {
 
   log(`[${taskIdentifier}] Copying local repo to staging: ${stagingPath}`);
 
-  // Use git clone --local for efficiency (hardlinks where possible)
-  execSync(`git clone --local "${LOCAL_REPO_PATH}" "${stagingPath}/repo"`, { stdio: "pipe" });
+  // Use --no-hardlinks so the container can chown the .git objects
+  execSync(`git clone --no-hardlinks "${LOCAL_REPO_PATH}" "${stagingPath}/repo"`, { stdio: "pipe" });
 
   // Ensure the remote points to the actual remote, not the local path
   if (REPO_URL) {
