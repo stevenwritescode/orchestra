@@ -461,13 +461,17 @@ ${task.comments?.nodes?.length ? `\nComments from the team:\n${task.comments.nod
 ${extraPrompt ? `\nAdditional context:\n${extraPrompt}` : ""}
 
 Instructions:
-1. Read the codebase to understand the relevant code
-2. Implement the requested changes
-3. Write or update tests if appropriate
-4. Run the existing test suite to verify nothing is broken
-5. If tests pass, create a branch named "${branchName}", commit your changes, and push
-6. Create a draft ${mrTerm} using ${cliName} CLI with a clear description linking back to ${task.identifier}
-7. If you cannot complete the task, write a detailed explanation of what blockers you hit
+1. FIRST: Create and switch to branch "${branchName}" immediately:
+   git checkout -b ${branchName}
+   This must be done BEFORE any other work so nothing is lost.
+2. Read the codebase to understand the relevant code
+3. Implement the requested changes
+4. Commit frequently as you make progress (don't wait until the end)
+5. Write or update tests if appropriate
+6. Run the existing test suite to verify nothing is broken
+7. Push the branch: git push -u origin ${branchName}
+8. Create a draft ${mrTerm} using ${cliName} CLI with a clear description linking back to ${task.identifier}
+9. If you cannot complete the task, still commit and push whatever progress you've made with a WIP commit
 ${backendPromptSection}
 
 Commit message format: ${task.identifier}: [short description]
@@ -783,6 +787,83 @@ async function runBackendTests(repoPath) {
   return { success, output };
 }
 
+// ─── Rescue unpushed work from staging copy ─────────────────────────────────
+// If the agent created a branch and committed but didn't push (timeout, error,
+// etc.), this saves the work by pushing from the host.
+function rescueUnpushedWork(stagingPath, taskIdentifier) {
+  if (!stagingPath) return;
+  const repoPath = join(stagingPath, "repo");
+  if (!existsSync(join(repoPath, ".git"))) return;
+
+  try {
+    // Check what branch we're on
+    const branch = execSync(`git -C "${repoPath}" rev-parse --abbrev-ref HEAD`, {
+      encoding: "utf8", stdio: "pipe"
+    }).trim();
+
+    log(`[${taskIdentifier}] Staging repo is on branch: ${branch}`);
+
+    // Check if there are uncommitted changes
+    const status = execSync(`git -C "${repoPath}" status --porcelain`, {
+      encoding: "utf8", stdio: "pipe"
+    }).trim();
+
+    if (status) {
+      log(`[${taskIdentifier}] Found uncommitted changes — committing as WIP`);
+      execSync(`git -C "${repoPath}" add -A`, { stdio: "pipe" });
+      execSync(`git -C "${repoPath}" commit -m "${taskIdentifier}: WIP — rescued uncommitted work"`, {
+        stdio: "pipe",
+        env: { ...process.env, GIT_AUTHOR_NAME: "claude-task-runner", GIT_AUTHOR_EMAIL: "claude-task-runner@automated",
+               GIT_COMMITTER_NAME: "claude-task-runner", GIT_COMMITTER_EMAIL: "claude-task-runner@automated" },
+      });
+    }
+
+    // Check if the branch has commits beyond main/master
+    let hasCommits = false;
+    for (const base of ["main", "master"]) {
+      try {
+        const count = execSync(`git -C "${repoPath}" rev-list --count ${base}..${branch}`, {
+          encoding: "utf8", stdio: "pipe"
+        }).trim();
+        if (parseInt(count) > 0) {
+          hasCommits = true;
+          log(`[${taskIdentifier}] Branch ${branch} has ${count} commit(s) ahead of ${base}`);
+        }
+        break;
+      } catch {
+        // base branch doesn't exist, try the other
+      }
+    }
+
+    if (!hasCommits) {
+      log(`[${taskIdentifier}] No commits to rescue`);
+      return;
+    }
+
+    // Check if already pushed
+    try {
+      execSync(`git -C "${repoPath}" rev-parse origin/${branch}`, { stdio: "pipe" });
+      // If that succeeds, check if local is ahead
+      const ahead = execSync(`git -C "${repoPath}" rev-list --count origin/${branch}..${branch}`, {
+        encoding: "utf8", stdio: "pipe"
+      }).trim();
+      if (ahead === "0") {
+        log(`[${taskIdentifier}] Branch ${branch} already pushed — nothing to rescue`);
+        return;
+      }
+      log(`[${taskIdentifier}] Branch ${branch} has ${ahead} unpushed commit(s) — pushing`);
+    } catch {
+      log(`[${taskIdentifier}] Branch ${branch} not yet pushed — pushing`);
+    }
+
+    // Push it
+    execSync(`git -C "${repoPath}" push -u origin ${branch}`, { stdio: "pipe" });
+    log(`[${taskIdentifier}] Rescued work pushed to origin/${branch}`);
+  } catch (err) {
+    log(`[${taskIdentifier}] Could not rescue work: ${err.message}`);
+  }
+}
+
 function cleanupStaging(stagingPath) {
   if (stagingPath && existsSync(stagingPath)) {
     try {
@@ -849,6 +930,8 @@ async function processTask(task) {
 
     if (outcome.exitCode !== 0) {
       log(`[${task.identifier}] Failed with exit code ${outcome.exitCode}`);
+      // Rescue any work the agent did before failing
+      rescueUnpushedWork(outcome.stagingPath, task.identifier);
       await addIssueComment(task.id,
         `❌ Automated implementation failed (exit code ${outcome.exitCode}).\n\n**Error output:**\n\`\`\`\n${outcome.stderr.slice(-1500)}\n\`\`\`\n\nThis task needs manual attention.`
       );
@@ -955,6 +1038,9 @@ The orchestrator will re-run the backend tests after you commit.`;
         // best-effort cleanup
       }
     }
+
+    // Rescue any unpushed work before cleaning up
+    rescueUnpushedWork(lastStagingPath, task.identifier);
 
     // Clean up staging directory
     cleanupStaging(lastStagingPath);
