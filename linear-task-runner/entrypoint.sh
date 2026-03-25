@@ -216,13 +216,30 @@ fi
 chown -R claude-runner:claude-runner /workspace
 
 # ─── Drop to non-root and execute command ────────────────────────────────────
-CA_ENV=""
+# Write a wrapper script so the multi-line prompt doesn't get mangled by su -c.
+# The wrapper sets env vars and exec's the command with proper quoting.
+WRAPPER=/tmp/run-as-claude.sh
+cat > "$WRAPPER" <<'WRAPPER_HEAD'
+#!/bin/bash
+cd /workspace/repo || exit 1
+WRAPPER_HEAD
+
+# Append env vars
 if [ -n "${NODE_EXTRA_CA_CERTS:-}" ]; then
-    CA_ENV="NODE_EXTRA_CA_CERTS='${NODE_EXTRA_CA_CERTS}'"
+    echo "export NODE_EXTRA_CA_CERTS='${NODE_EXTRA_CA_CERTS}'" >> "$WRAPPER"
 fi
+echo "export ANTHROPIC_API_KEY='${ANTHROPIC_API_KEY}'" >> "$WRAPPER"
 
 if [ "$GIT_PROVIDER" = "github" ]; then
-    exec su - claude-runner -c "cd /workspace/repo && ${CA_ENV} ANTHROPIC_API_KEY='${ANTHROPIC_API_KEY}' GITHUB_TOKEN='${GITHUB_TOKEN}' GH_TOKEN='${GITHUB_TOKEN}' $*"
+    echo "export GITHUB_TOKEN='${GITHUB_TOKEN}'" >> "$WRAPPER"
+    echo "export GH_TOKEN='${GITHUB_TOKEN}'" >> "$WRAPPER"
 else
-    exec su - claude-runner -c "cd /workspace/repo && ${CA_ENV} ANTHROPIC_API_KEY='${ANTHROPIC_API_KEY}' GITLAB_TOKEN='${GITLAB_TOKEN}' $*"
+    echo "export GITLAB_TOKEN='${GITLAB_TOKEN}'" >> "$WRAPPER"
 fi
+
+# Write the actual command, using "$@" to preserve argument boundaries
+echo 'exec "$@"' >> "$WRAPPER"
+chmod +x "$WRAPPER"
+chown claude-runner:claude-runner "$WRAPPER"
+
+exec su - claude-runner -s /bin/bash -- "$WRAPPER" "$@"

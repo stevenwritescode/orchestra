@@ -412,8 +412,6 @@ ${mrTerm.charAt(0).toUpperCase() + mrTerm.slice(1)} title format: ${draftTitle}
 Use ${cliName} CLI to create the ${mrTerm}. Link it to the task by including "${task.url}" in the ${mrTerm} body.
 Example: ${cliExample}`;
 
-    const escapedPrompt = prompt.replace(/'/g, "'\\''");
-
     const dockerArgs = [
       "run",
       "--rm",
@@ -475,7 +473,7 @@ Example: ${cliExample}`;
 
     dockerArgs.push(
       DOCKER_IMAGE,
-      "claude", "-p", escapedPrompt,
+      "claude", "-p", prompt,
       "--dangerously-skip-permissions",
       "--model", CLAUDE_MODEL,
       "--max-turns", String(MAX_TURNS),
