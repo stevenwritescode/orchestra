@@ -208,17 +208,33 @@ async function fetchPendingTasks() {
 
 // ─── Update Linear issue status ─────────────────────────────────────────────
 async function updateIssueStatus(issueId, statusName) {
+  // First get the issue's team so we find the right workflow state
+  const issueData = await linearQuery(`
+    query GetIssueTeam($id: String!) {
+      issue(id: $id) {
+        team { id }
+      }
+    }
+  `, { id: issueId });
+
+  const teamId = issueData.issue?.team?.id;
+  if (!teamId) {
+    console.error(`Could not find team for issue: ${issueId}`);
+    return;
+  }
+
+  // Find the workflow state matching this name for THIS team
   const statesData = await linearQuery(`
-    query States {
-      workflowStates(filter: { name: { eq: "${statusName}" } }) {
+    query States($teamId: String!) {
+      workflowStates(filter: { name: { eq: "${statusName}" }, team: { id: { eq: $teamId } } }) {
         nodes { id name }
       }
     }
-  `);
+  `, { teamId });
 
   const state = statesData.workflowStates.nodes[0];
   if (!state) {
-    console.error(`Could not find workflow state: ${statusName}`);
+    console.error(`Could not find workflow state "${statusName}" for team ${teamId}`);
     return;
   }
 
