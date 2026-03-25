@@ -225,7 +225,7 @@ async function updateIssueStatus(issueId, statusName) {
 
   // Find the workflow state matching this name for THIS team
   const statesData = await linearQuery(`
-    query States($teamId: String!) {
+    query States($teamId: ID!) {
       workflowStates(filter: { name: { eq: "${statusName}" }, team: { id: { eq: $teamId } } }) {
         nodes { id name }
       }
