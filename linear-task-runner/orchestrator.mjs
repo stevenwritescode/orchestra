@@ -481,7 +481,8 @@ Example: ${cliExample}`;
       "--dangerously-skip-permissions",
       "--model", CLAUDE_MODEL,
       "--max-turns", String(MAX_TURNS),
-      "--output-format", "json",
+      "--verbose",
+      "--output-format", "stream-json",
     );
 
     log(`[${task.identifier}] Spawning container: ${containerName}`);
@@ -500,7 +501,28 @@ Example: ${cliExample}`;
     });
 
     proc.stdout.on("data", (chunk) => {
-      stdout += chunk.toString();
+      const text = chunk.toString();
+      stdout += text;
+      // Stream progress to console — each line is a JSON event
+      for (const line of text.split("\n")) {
+        if (!line.trim()) continue;
+        try {
+          const event = JSON.parse(line);
+          if (event.type === "assistant" && event.message?.content) {
+            for (const block of event.message.content) {
+              if (block.type === "text") {
+                log(`[${task.identifier}] Claude: ${block.text.slice(0, 200)}`);
+              } else if (block.type === "tool_use") {
+                log(`[${task.identifier}] Tool: ${block.name}${block.input?.command ? ` → ${block.input.command.slice(0, 100)}` : ""}`);
+              }
+            }
+          } else if (event.type === "result") {
+            log(`[${task.identifier}] Result: ${(event.result || "").slice(0, 200)}`);
+          }
+        } catch {
+          // not valid JSON line, ignore
+        }
+      }
     });
 
     proc.stderr.on("data", (chunk) => {
