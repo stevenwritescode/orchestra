@@ -587,7 +587,8 @@ function prepareStagingCopy(taskIdentifier) {
 
   // Plain cp instead of git clone — avoids hardlinked .git pack files
   // that cause chown permission errors in the container
-  execSync(`cp -a "${LOCAL_REPO_PATH}" "${stagingPath}/repo"`, { stdio: "pipe" });
+  // cp -r (not -a) so ownership isn't preserved — lets the container chown freely
+  execSync(`cp -r "${LOCAL_REPO_PATH}" "${stagingPath}/repo"`, { stdio: "pipe" });
 
   // Ensure the remote points to the actual remote, not the local path
   if (REPO_URL) {
