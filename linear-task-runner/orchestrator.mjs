@@ -585,12 +585,12 @@ function prepareStagingCopy(taskIdentifier) {
   const stagingPath = join(STAGING_DIR, `task-${taskIdentifier}-${randomUUID().slice(0, 8)}`);
   mkdirSync(stagingPath, { recursive: true });
 
+  const copyStart = Date.now();
   log(`[${taskIdentifier}] Copying local repo to staging: ${stagingPath}`);
 
-  // Plain cp instead of git clone — avoids hardlinked .git pack files
-  // that cause chown permission errors in the container
   // cp -r (not -a) so ownership isn't preserved — lets the container chown freely
   execSync(`cp -r "${LOCAL_REPO_PATH}" "${stagingPath}/repo"`, { stdio: "pipe" });
+  log(`[${taskIdentifier}] Copy took ${((Date.now() - copyStart) / 1000).toFixed(1)}s`);
 
   // Ensure the remote points to the actual remote, not the local path
   if (REPO_URL) {
@@ -828,10 +828,9 @@ Example: ${cliExample}`;
       "--rm",
       "--name", containerName,
       "--cap-add=NET_ADMIN",
-      // Pass Anthropic credentials — use the right env var for the auth mode
-      ...(ANTHROPIC_AUTH_MODE === "oauth"
-        ? ["-e", `ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_API_KEY}`]
-        : ["-e", `ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}`]),
+      // Pass Anthropic credentials — OAuth tokens from Claude Code login
+      // work as API keys (sk-ant-oat01-... format)
+      "-e", `ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}`,
       "-e", `GIT_PROVIDER=${GIT_PROVIDER}`,
       ...(process.env.CUSTOM_CA_CERT ? ["-e", `CUSTOM_CA_CERT=${process.env.CUSTOM_CA_CERT}`] : []),
       "--memory=4g",
@@ -900,7 +899,9 @@ Example: ${cliExample}`;
       "--output-format", "stream-json",
     );
 
+    const spawnStart = Date.now();
     log(`[${task.identifier}] Spawning container: ${containerName}`);
+    log(`[${task.identifier}] Auth mode: ${ANTHROPIC_AUTH_MODE}`);
     if (LOCAL_REPO_PATH) {
       log(`[${task.identifier}] Using local repo: ${LOCAL_REPO_PATH} → staging: ${stagingPath}`);
     }
@@ -1013,7 +1014,8 @@ Example: ${cliExample}`;
       // Stop signal watcher
       if (signalWatcherInterval) clearInterval(signalWatcherInterval);
 
-      log(`[${task.identifier}] Container exited with code ${code}`);
+      const elapsed = ((Date.now() - spawnStart) / 1000).toFixed(0);
+      log(`[${task.identifier}] Container exited with code ${code} after ${elapsed}s`);
 
       let result = null;
       try {
