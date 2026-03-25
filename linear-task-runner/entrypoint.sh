@@ -87,6 +87,25 @@ else
     echo "[entrypoint] For maximum security, run with --cap-add=NET_ADMIN"
 fi
 
+# ─── Install custom CA cert (e.g. Zscaler) ───────────────────────────────────
+# CUSTOM_CA_CERT can be an absolute path or relative to /workspace/repo.
+# Set it only on networks that do SSL inspection. Leave empty otherwise.
+if [ -n "${CUSTOM_CA_CERT:-}" ]; then
+    CERT_PATH="$CUSTOM_CA_CERT"
+    # If relative, resolve against the repo
+    if [[ "$CERT_PATH" != /* ]]; then
+        CERT_PATH="/workspace/repo/${CERT_PATH}"
+    fi
+    if [ -f "$CERT_PATH" ]; then
+        cp "$CERT_PATH" /usr/local/share/ca-certificates/custom-ca.crt
+        update-ca-certificates 2>/dev/null
+        export NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/custom-ca.crt
+        echo "[entrypoint] Custom CA cert installed from ${CERT_PATH}"
+    else
+        echo "[entrypoint] WARNING: CUSTOM_CA_CERT set but file not found: ${CERT_PATH}"
+    fi
+fi
+
 # ─── Setup git config ───────────────────────────────────────────────────────
 git config --global user.name "claude-task-runner"
 git config --global user.email "claude-task-runner@automated"
@@ -188,8 +207,13 @@ fi
 chown -R claude-runner:claude-runner /workspace
 
 # ─── Drop to non-root and execute command ────────────────────────────────────
+CA_ENV=""
+if [ -n "${NODE_EXTRA_CA_CERTS:-}" ]; then
+    CA_ENV="NODE_EXTRA_CA_CERTS='${NODE_EXTRA_CA_CERTS}'"
+fi
+
 if [ "$GIT_PROVIDER" = "github" ]; then
-    exec su - claude-runner -c "cd /workspace/repo && ANTHROPIC_API_KEY='${ANTHROPIC_API_KEY}' GITHUB_TOKEN='${GITHUB_TOKEN}' GH_TOKEN='${GITHUB_TOKEN}' $*"
+    exec su - claude-runner -c "cd /workspace/repo && ${CA_ENV} ANTHROPIC_API_KEY='${ANTHROPIC_API_KEY}' GITHUB_TOKEN='${GITHUB_TOKEN}' GH_TOKEN='${GITHUB_TOKEN}' $*"
 else
-    exec su - claude-runner -c "cd /workspace/repo && ANTHROPIC_API_KEY='${ANTHROPIC_API_KEY}' GITLAB_TOKEN='${GITLAB_TOKEN}' $*"
+    exec su - claude-runner -c "cd /workspace/repo && ${CA_ENV} ANTHROPIC_API_KEY='${ANTHROPIC_API_KEY}' GITLAB_TOKEN='${GITLAB_TOKEN}' $*"
 fi
