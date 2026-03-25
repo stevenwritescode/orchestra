@@ -400,6 +400,23 @@ function prepareStagingCopy(taskIdentifier) {
     execSync(`git -C "${stagingPath}/repo" remote set-url origin "${REPO_URL}"`, { stdio: "pipe" });
   }
 
+  // Always start from the latest main/master regardless of what branch was checked out locally
+  const repoDir = `${stagingPath}/repo`;
+  try {
+    execSync(`git -C "${repoDir}" fetch origin`, { stdio: "pipe" });
+    // Try main first, fall back to master
+    try {
+      execSync(`git -C "${repoDir}" checkout main`, { stdio: "pipe" });
+      execSync(`git -C "${repoDir}" reset --hard origin/main`, { stdio: "pipe" });
+    } catch {
+      execSync(`git -C "${repoDir}" checkout master`, { stdio: "pipe" });
+      execSync(`git -C "${repoDir}" reset --hard origin/master`, { stdio: "pipe" });
+    }
+    log(`[${taskIdentifier}] Staging repo reset to latest main`);
+  } catch (err) {
+    log(`[${taskIdentifier}] Warning: could not reset to main: ${err.message}`);
+  }
+
   return stagingPath;
 }
 
