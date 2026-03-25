@@ -255,6 +255,13 @@ async function fetchPendingTasks() {
               createdAt
             }
           }
+          attachments {
+            nodes {
+              title
+              url
+              sourceType
+            }
+          }
         }
       }
     }
@@ -396,6 +403,100 @@ function prepareStagingCopy(taskIdentifier) {
   return stagingPath;
 }
 
+// ─── Download images from Linear comments/attachments ───────────────────────
+// Linear stores images as markdown ![alt](url) in comment bodies.
+// We download them to the staging dir so the agent can view them.
+async function downloadTaskImages(task, destDir) {
+  mkdirSync(destDir, { recursive: true });
+  const downloaded = [];
+
+  // Extract image URLs from markdown in description and comments
+  const allText = [
+    task.description || "",
+    ...(task.comments?.nodes?.map((c) => c.body) || []),
+  ].join("\n");
+
+  const imgRegex = /!\[([^\]]*)\]\(([^)]+)\)/g;
+  let match;
+  let idx = 0;
+  while ((match = imgRegex.exec(allText)) !== null) {
+    const [, alt, url] = match;
+    if (!url.startsWith("http")) continue;
+    idx++;
+    const ext = url.match(/\.(png|jpg|jpeg|gif|webp|svg)/i)?.[1] || "png";
+    const filename = `image-${idx}.${ext}`;
+    const filepath = join(destDir, filename);
+    try {
+      const res = await fetch(url);
+      if (res.ok) {
+        const buffer = Buffer.from(await res.arrayBuffer());
+        writeFileSync(filepath, buffer);
+        downloaded.push({ filename, alt: alt || `image-${idx}`, url });
+        log(`[${task.identifier}] Downloaded image: ${filename} (${alt || url.slice(0, 60)})`);
+      }
+    } catch (err) {
+      log(`[${task.identifier}] Failed to download image ${url.slice(0, 60)}: ${err.message}`);
+    }
+  }
+
+  // Also grab attachments from the task
+  for (const att of task.attachments?.nodes || []) {
+    if (!att.url?.startsWith("http")) continue;
+    idx++;
+    const ext = att.url.match(/\.(png|jpg|jpeg|gif|webp|svg|pdf)/i)?.[1] || "png";
+    const filename = `attachment-${idx}.${ext}`;
+    const filepath = join(destDir, filename);
+    try {
+      const res = await fetch(att.url);
+      if (res.ok) {
+        const buffer = Buffer.from(await res.arrayBuffer());
+        writeFileSync(filepath, buffer);
+        downloaded.push({ filename, alt: att.title || `attachment-${idx}`, url: att.url });
+        log(`[${task.identifier}] Downloaded attachment: ${filename} (${att.title || "untitled"})`);
+      }
+    } catch (err) {
+      log(`[${task.identifier}] Failed to download attachment: ${err.message}`);
+    }
+  }
+
+  return downloaded;
+}
+
+// ─── Build label-based scope instructions ───────────────────────────────────
+function buildScopeInstructions(task) {
+  const labels = (task.labels?.nodes || []).map((l) => l.name.toLowerCase());
+
+  const hasFrontend = labels.some((l) => l.includes("frontend") || l.includes("front-end") || l.includes("ui") || l.includes("client"));
+  const hasBackend = labels.some((l) => l.includes("backend") || l.includes("back-end") || l.includes("api") || l.includes("server"));
+
+  if (hasFrontend && !hasBackend) {
+    return `
+SCOPE — FRONTEND ONLY:
+This task is labeled as frontend work. Focus exclusively on the frontend/client side:
+- Only modify frontend code (components, pages, styles, client-side logic)
+- If the feature requires backend changes (new API endpoints, data models, etc.),
+  create stub/placeholder implementations with TODO comments explaining what the
+  backend needs to provide (expected request/response shapes, endpoint paths, etc.)
+- Do NOT modify backend/server code beyond adding stubs
+- Make the frontend work with mock data or stub responses where needed`;
+  }
+
+  if (hasBackend && !hasFrontend) {
+    return `
+SCOPE — BACKEND ONLY:
+This task is labeled as backend work. Focus exclusively on the backend/server side:
+- Only modify backend code (API endpoints, services, data models, middleware)
+- If the feature requires frontend changes (new UI, forms, displays, etc.),
+  create stub/placeholder components or document what the frontend needs in
+  TODO comments (expected props, API response shapes, endpoint paths, etc.)
+- Do NOT modify frontend/client code beyond adding stubs
+- Ensure API contracts are well-documented for the frontend team`;
+  }
+
+  // Both labels or neither — no scope restriction
+  return "";
+}
+
 // ─── Run Claude Code in a sandboxed Docker container ────────────────────────
 // Supports three repo modes:
 //   1. REPO_URL mode: container clones from GitLab (original behavior)
@@ -405,12 +506,32 @@ function prepareStagingCopy(taskIdentifier) {
 //      orchestrator runs tests between agent sessions
 //   B. Live access (BACKEND_LIVE_ACCESS): agent can curl the backend directly,
 //      and signal the orchestrator to rebuild it mid-session
-function runInContainer(task, extraPrompt = "") {
-  return new Promise((resolve, reject) => {
-    const containerName = `task-${task.identifier}-${randomUUID().slice(0, 8)}`;
-    const branchName = `task/${task.identifier.toLowerCase()}`;
-    let stagingPath = null;
+async function runInContainer(task, extraPrompt = "") {
+  const containerName = `task-${task.identifier}-${randomUUID().slice(0, 8)}`;
+  const branchName = `task/${task.identifier.toLowerCase()}`;
+  let stagingPath = null;
 
+  // Prepare staging copy early so we can download images into it
+  if (LOCAL_REPO_PATH) {
+    stagingPath = prepareStagingCopy(task.identifier);
+  }
+
+  // Download images from the task's description, comments, and attachments
+  let imagePromptSection = "";
+  const imagesDir = stagingPath
+    ? join(stagingPath, "images")
+    : join(STAGING_DIR, `images-${containerName}`);
+  const downloadedImages = await downloadTaskImages(task, imagesDir);
+  if (downloadedImages.length > 0) {
+    imagePromptSection = `
+REFERENCE IMAGES:
+The following images were attached to this task. Review them for context (mockups, screenshots, diagrams).
+They are located at /workspace/images/ inside the container:
+${downloadedImages.map((img) => `- /workspace/images/${img.filename} — ${img.alt}`).join("\n")}
+Use the Read tool to view these image files before implementing.`;
+  }
+
+  return new Promise((resolve, reject) => {
     // Build the backend-specific prompt section
     let backendPromptSection = "";
     if (BACKEND_LIVE_ACCESS) {
@@ -448,17 +569,23 @@ Focus on making code changes, running any non-Docker tests, and committing.`;
       ? `gh pr create --draft --title "${draftTitle}" --body "..." --head "${branchName}" --base main`
       : `glab mr create --draft --title "${draftTitle}" --description "..." --source-branch "${branchName}" --target-branch main`;
 
+    const scopeInstructions = buildScopeInstructions(task);
+    const labelsList = (task.labels?.nodes || []).map((l) => l.name).join(", ");
+
     const prompt = `You are an autonomous developer working on a task from the project tracker.
 
 Task: ${task.title}
 Task ID: ${task.identifier}
 Priority: ${task.priority || "none"}
+Labels: ${labelsList || "none"}
 ${task.project ? `Project: ${task.project.name}` : ""}
 
 Description:
 ${task.description || "No description provided."}
 ${task.comments?.nodes?.length ? `\nComments from the team:\n${task.comments.nodes.map((c) => `[${c.user?.name || "Unknown"}]: ${c.body}`).join("\n\n")}` : ""}
 ${extraPrompt ? `\nAdditional context:\n${extraPrompt}` : ""}
+${scopeInstructions}
+${imagePromptSection}
 
 Instructions:
 1. FIRST: Create and switch to branch "${branchName}" immediately:
@@ -514,7 +641,7 @@ Example: ${cliExample}`;
 
     // Decide how the repo gets into the container
     if (LOCAL_REPO_PATH) {
-      stagingPath = prepareStagingCopy(task.identifier);
+      // stagingPath already created above (before image download)
       dockerArgs.push(
         "-v", `${stagingPath}/repo:/workspace/repo`,
         "-e", `REPO_URL=${REPO_URL || ""}`,
@@ -524,6 +651,11 @@ Example: ${cliExample}`;
       dockerArgs.push(
         "-e", `REPO_URL=${REPO_URL}`,
       );
+    }
+
+    // Mount images directory if we downloaded any
+    if (downloadedImages.length > 0) {
+      dockerArgs.push("-v", `${imagesDir}:/workspace/images:ro`);
     }
 
     // Live backend access: let the agent reach the backend on the host
