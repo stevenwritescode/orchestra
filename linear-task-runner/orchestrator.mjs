@@ -163,6 +163,54 @@ const MAX_CONCURRENT_TASKS = parseInt(process.env.MAX_CONCURRENT_TASKS || "3");
 // Staging directory for extracting agent changes before backend testing
 const STAGING_DIR = process.env.STAGING_DIR || "/tmp/task-staging";
 
+// File-based task tracking — survives orchestrator restarts
+const TASK_STATE_FILE = join(__dirname, ".task-state.json");
+
+function loadTaskState() {
+  if (!existsSync(TASK_STATE_FILE)) return {};
+  try {
+    return JSON.parse(readFileSync(TASK_STATE_FILE, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function saveTaskState(state) {
+  writeFileSync(TASK_STATE_FILE, JSON.stringify(state, null, 2));
+}
+
+function markTaskActive(identifier) {
+  const state = loadTaskState();
+  state[identifier] = { status: "active", startedAt: new Date().toISOString() };
+  saveTaskState(state);
+}
+
+function markTaskDone(identifier, result) {
+  const state = loadTaskState();
+  state[identifier] = { status: "done", result, finishedAt: new Date().toISOString() };
+  saveTaskState(state);
+}
+
+function isTaskAlreadyHandled(identifier) {
+  const state = loadTaskState();
+  const entry = state[identifier];
+  if (!entry) return false;
+
+  if (entry.status === "active") {
+    // Check if it's been active for too long (stale from a crash) — 2 hours
+    const staleMs = 2 * 60 * 60 * 1000;
+    if (Date.now() - new Date(entry.startedAt).getTime() > staleMs) {
+      log(`[${identifier}] Stale active state (started ${entry.startedAt}) — re-processing`);
+      return false;
+    }
+    return true;
+  }
+
+  if (entry.status === "done") return true;
+
+  return false;
+}
+
 // Linear filter — LINEAR_STATUS supports comma-separated values (e.g. "Backlog,In Progress")
 const LINEAR_LABEL = process.env.LINEAR_LABEL || "autofix";
 const LINEAR_STATUS_RAW = process.env.LINEAR_STATUS || "Todo";
@@ -1233,6 +1281,7 @@ function cleanupStaging(stagingPath) {
 async function processTask(task) {
   log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
   log(`Processing: ${task.identifier} — ${task.title}`);
+  markTaskActive(task.identifier);
   log(`[${task.identifier}] Description: ${(task.description || "none").slice(0, 200)}${(task.description || "").length > 200 ? "..." : ""}`);
   if (task.comments?.nodes?.length) {
     log(`[${task.identifier}] ${task.comments.nodes.length} comment(s) from team:`);
@@ -1481,8 +1530,9 @@ async function main() {
             log(`Poll #${pollCount}: all issues with label "${LINEAR_LABEL}":`);
             for (const issue of allIssues) {
               const active = activeTasks.has(issue.identifier) ? " ← ACTIVE" : "";
+              const handled = isTaskAlreadyHandled(issue.identifier) ? " ← DONE" : "";
               const match = LINEAR_STATUSES.includes(issue.state.name) ? " ← MATCH" : "";
-              log(`  → ${issue.identifier}: ${issue.title} [status: "${issue.state.name}"]${match}${active}`);
+              log(`  → ${issue.identifier}: ${issue.title} [status: "${issue.state.name}"]${match}${active}${handled}`);
             }
           }
         } catch (err) {
@@ -1492,8 +1542,8 @@ async function main() {
 
       const tasks = await fetchPendingTasks();
 
-      // Filter out tasks we're already working on
-      const newTasks = tasks.filter((t) => !activeTasks.has(t.identifier));
+      // Filter out tasks we're already working on (in-memory) or have already handled (on disk)
+      const newTasks = tasks.filter((t) => !activeTasks.has(t.identifier) && !isTaskAlreadyHandled(t.identifier));
       // Respect concurrency limit
       const slots = MAX_CONCURRENT_TASKS - activeTasks.size;
 
@@ -1514,7 +1564,11 @@ async function main() {
         // Launch tasks concurrently — each runs in the background
         for (const task of toStart) {
           const taskPromise = processTask(task)
-            .catch((err) => log(`[${task.identifier}] Unhandled error: ${err.message}`))
+            .then(() => markTaskDone(task.identifier, "completed"))
+            .catch((err) => {
+              log(`[${task.identifier}] Unhandled error: ${err.message}`);
+              markTaskDone(task.identifier, `error: ${err.message}`);
+            })
             .finally(() => {
               activeTasks.delete(task.identifier);
               log(`[${task.identifier}] Task finished. Active: ${activeTasks.size}/${MAX_CONCURRENT_TASKS}`);
