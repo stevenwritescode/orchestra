@@ -693,10 +693,20 @@ Example: ${cliExample}`;
       );
     }
 
+    const cliTool = GIT_PROVIDER === "github" ? "gh" : "glab";
+
     dockerArgs.push(
       DOCKER_IMAGE,
       "claude", "-p", prompt,
-      "--dangerously-skip-permissions",
+      "--allowedTools", "Read", "Edit", "Write", "Glob", "Grep",
+        `Bash(git *)`, `Bash(${cliTool} *)`,
+        "Bash(npm test*)", "Bash(npm run *)", "Bash(npm install*)",
+        "Bash(npx *)", "Bash(node *)",
+        "Bash(pytest*)", "Bash(python *)",
+        "Bash(cargo test*)", "Bash(go test*)",
+        "Bash(make *)",
+        "Bash(ls *)", "Bash(cat *)", "Bash(find *)",
+        "Bash(curl *)", "Bash(echo *)",
       "--model", CLAUDE_MODEL,
       "--max-turns", String(MAX_TURNS),
       "--verbose",
