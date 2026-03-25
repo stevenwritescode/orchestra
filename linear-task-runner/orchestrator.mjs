@@ -151,6 +151,12 @@ const BACKEND_LIVE_ACCESS = process.env.BACKEND_LIVE_ACCESS === "true";
 const BACKEND_PORT = process.env.BACKEND_PORT || "3000";
 const SIGNAL_POLL_MS = 2000; // how often to check for rebuild signals
 
+// Review feedback loop: after the MR/PR is created, poll for review comments
+// and spawn revision sessions to address them.
+const REVIEW_POLL_INTERVAL_MS = parseInt(process.env.REVIEW_POLL_INTERVAL_MS || "30000"); // 30s
+const MAX_REVIEW_ROUNDS = parseInt(process.env.MAX_REVIEW_ROUNDS || "5");
+const REVIEW_WAIT_TIMEOUT_MS = parseInt(process.env.REVIEW_WAIT_TIMEOUT_MS || "3600000"); // 1 hour
+
 // Staging directory for extracting agent changes before backend testing
 const STAGING_DIR = process.env.STAGING_DIR || "/tmp/task-staging";
 
@@ -381,6 +387,193 @@ async function checkForMR(taskIdentifier) {
   } catch {
     return null;
   }
+}
+
+// ─── Fetch review comments on an MR/PR ──────────────────────────────────────
+// Returns new comments since lastCheckedAt (ISO string or null for all).
+// Filters out bot comments to avoid self-loops.
+async function fetchReviewComments(mrId, lastCheckedAt) {
+  const comments = [];
+
+  try {
+    if (GIT_PROVIDER === "github") {
+      // GitHub: fetch both review comments and issue comments
+      const [reviewComments, issueComments] = await Promise.all([
+        gitApi("GET", `/pulls/${mrId}/comments?sort=created&direction=desc&per_page=50`),
+        gitApi("GET", `/issues/${mrId}/comments?sort=created&direction=desc&per_page=50`),
+      ]);
+
+      for (const c of [...reviewComments, ...issueComments]) {
+        if (lastCheckedAt && new Date(c.created_at) <= new Date(lastCheckedAt)) continue;
+        // Skip bot comments
+        const login = c.user?.login?.toLowerCase() || "";
+        if (login.includes("bot") || login.includes("claude") || login === "github-actions[bot]") continue;
+        comments.push({
+          author: c.user?.login || "unknown",
+          body: c.body,
+          created_at: c.created_at,
+          path: c.path || null, // file path for review comments
+        });
+      }
+    } else {
+      // GitLab: fetch discussions (threads)
+      const iid = mrId.iid || mrId;
+      const discussions = await gitApi("GET", `/merge_requests/${iid}/discussions`);
+
+      for (const disc of discussions) {
+        for (const note of disc.notes) {
+          if (note.system) continue;
+          if (lastCheckedAt && new Date(note.created_at) <= new Date(lastCheckedAt)) continue;
+          // Skip bot comments
+          const username = note.author?.username?.toLowerCase() || "";
+          if (username.includes("bot") || username.includes("claude")) continue;
+          // Skip resolved threads
+          if (note.resolvable && note.resolved) continue;
+          comments.push({
+            author: note.author?.username || "unknown",
+            body: note.body,
+            created_at: note.created_at,
+            path: note.position?.new_path || null,
+          });
+        }
+      }
+    }
+  } catch (err) {
+    log(`[review] Error fetching comments: ${err.message}`);
+  }
+
+  // Sort oldest first
+  comments.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+  return comments;
+}
+
+// ─── Check if MR/PR is approved or merged ───────────────────────────────────
+async function checkMRStatus(mrId) {
+  try {
+    if (GIT_PROVIDER === "github") {
+      const pr = await gitApi("GET", `/pulls/${mrId}`);
+      if (pr.merged) return "merged";
+      if (pr.state === "closed") return "closed";
+
+      // Check for approvals
+      const reviews = await gitApi("GET", `/pulls/${mrId}/reviews`);
+      const approved = reviews.some((r) => r.state === "APPROVED");
+      if (approved) return "approved";
+
+      return "open";
+    } else {
+      const iid = mrId.iid || mrId;
+      const mr = await gitApi("GET", `/merge_requests/${iid}`);
+      if (mr.state === "merged") return "merged";
+      if (mr.state === "closed") return "closed";
+
+      // Check for approvals
+      try {
+        const approvals = await gitApi("GET", `/merge_requests/${iid}/approvals`);
+        if (approvals.approved) return "approved";
+      } catch {
+        // Approvals API may not be available on all tiers
+      }
+
+      return "open";
+    }
+  } catch (err) {
+    log(`[review] Error checking MR status: ${err.message}`);
+    return "unknown";
+  }
+}
+
+// ─── Review feedback loop ───────────────────────────────────────────────────
+// After MR/PR is created, poll for comments. When new comments arrive,
+// spawn a revision container to address them. Repeat until approved,
+// merged, max rounds hit, or timeout.
+async function reviewFeedbackLoop(task, mr, stagingPath) {
+  const mrId = GIT_PROVIDER === "github" ? mr.number : (mr.iid || mr.number);
+  const branchName = `task/${task.identifier.toLowerCase()}`;
+  let lastCheckedAt = new Date().toISOString();
+  let round = 0;
+  const startTime = Date.now();
+
+  log(`[${task.identifier}] Entering review feedback loop (max ${MAX_REVIEW_ROUNDS} rounds, timeout ${REVIEW_WAIT_TIMEOUT_MS / 1000}s)`);
+  log(`[${task.identifier}] Polling for review comments every ${REVIEW_POLL_INTERVAL_MS / 1000}s...`);
+
+  while (round < MAX_REVIEW_ROUNDS) {
+    // Check timeout
+    if (Date.now() - startTime > REVIEW_WAIT_TIMEOUT_MS) {
+      log(`[${task.identifier}] Review loop timeout reached (${REVIEW_WAIT_TIMEOUT_MS / 1000}s) — exiting`);
+      break;
+    }
+
+    // Wait before polling
+    await new Promise((r) => setTimeout(r, REVIEW_POLL_INTERVAL_MS));
+
+    // Check if MR was approved or merged
+    const status = await checkMRStatus(mrId);
+    if (status === "approved") {
+      log(`[${task.identifier}] MR/PR approved! Review loop complete.`);
+      await updateIssueStatus(task.id, "Done");
+      return "approved";
+    }
+    if (status === "merged") {
+      log(`[${task.identifier}] MR/PR merged! Review loop complete.`);
+      await updateIssueStatus(task.id, "Done");
+      return "merged";
+    }
+    if (status === "closed") {
+      log(`[${task.identifier}] MR/PR was closed. Stopping review loop.`);
+      return "closed";
+    }
+
+    // Check for new comments
+    const newComments = await fetchReviewComments(mrId, lastCheckedAt);
+    if (newComments.length === 0) continue;
+
+    round++;
+    log(`[${task.identifier}] Review round ${round}/${MAX_REVIEW_ROUNDS}: ${newComments.length} new comment(s)`);
+    for (const c of newComments) {
+      log(`[${task.identifier}]   @${c.author}: ${c.body.slice(0, 150)}${c.body.length > 150 ? "..." : ""}`);
+    }
+
+    // Update lastCheckedAt to the newest comment
+    lastCheckedAt = newComments[newComments.length - 1].created_at;
+
+    // Build a revision prompt from the comments
+    const commentSummary = newComments
+      .map((c) => `@${c.author}${c.path ? ` (on ${c.path})` : ""}: ${c.body}`)
+      .join("\n\n---\n\n");
+
+    const revisionPrompt = `
+You are addressing review feedback on an open ${GIT_PROVIDER === "github" ? "pull request" : "merge request"}.
+
+Review comments to address (round ${round}/${MAX_REVIEW_ROUNDS}):
+${commentSummary}
+
+Instructions:
+1. You are already on branch "${branchName}" — do NOT create a new branch
+2. Read and understand each review comment
+3. Make the requested changes
+4. After each fix, commit and push immediately:
+   git add -A && git commit -m "${task.identifier}: address review feedback (round ${round})" && git push origin ${branchName}
+5. Only address what reviewers asked for — do not make unrelated changes
+6. If a comment is just approval/praise with no action needed, skip it`;
+
+    // Spawn a revision container
+    const revisionOutcome = await runInContainer(task, revisionPrompt);
+
+    if (revisionOutcome.exitCode !== 0) {
+      log(`[${task.identifier}] Revision round ${round} failed (exit code ${revisionOutcome.exitCode})`);
+      rescueUnpushedWork(revisionOutcome.stagingPath, task.identifier);
+      break;
+    }
+
+    log(`[${task.identifier}] Revision round ${round} complete — waiting for next review`);
+  }
+
+  if (round >= MAX_REVIEW_ROUNDS) {
+    log(`[${task.identifier}] Max review rounds (${MAX_REVIEW_ROUNDS}) reached — exiting loop`);
+  }
+
+  return "max_rounds";
 }
 
 // ─── Prepare a staging copy of the local repo ───────────────────────────────
@@ -1147,24 +1340,19 @@ The orchestrator will re-run the backend tests after you commit.`;
       }
     }
 
-    // ── Phase 3: Check for MR ──────────────────────────────────────────
+    // ── Phase 3: Check for MR and enter review loop ─────────────────────
     const mr = await checkForMR(task.identifier);
 
     if (mr) {
       log(`[${task.identifier}] MR created: ${mr.web_url}`);
-
-      await addIssueComment(task.id,
-        `✅ Automated implementation complete.\n\n**MR:** ${mr.web_url}\n**Title:** ${mr.title}\n\nPlease review and merge.`
-      );
       await updateIssueStatus(task.id, "In Review");
+
+      // Enter the review feedback loop — polls for comments and addresses them
+      const reviewResult = await reviewFeedbackLoop(task, mr, lastStagingPath);
+      log(`[${task.identifier}] Review loop ended: ${reviewResult}`);
 
     } else if (outcome.exitCode === 0) {
       log(`[${task.identifier}] Completed but no MR created.`);
-
-      const summary = outcome.result?.result || "No details available.";
-      await addIssueComment(task.id,
-        `⚠️ Task runner completed but could not open an MR.\n\n**Summary:**\n${summary.slice(0, 2000)}\n\nThis may need manual implementation.`
-      );
       await updateIssueStatus(task.id, "Todo");
 
     } else {
