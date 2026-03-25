@@ -904,10 +904,46 @@ async function main() {
     pollCount++;
     try {
       log(`Poll #${pollCount}: checking Linear for label="${LINEAR_LABEL}" status="${LINEAR_STATUS}"...`);
+
+      // Debug: show all issues with this label regardless of status
+      if (pollCount === 1 || pollCount % 10 === 0) {
+        try {
+          const debugData = await linearQuery(`
+            query DebugIssues($labelName: String!) {
+              issues(
+                filter: { labels: { name: { eq: $labelName } } }
+                first: 20
+                orderBy: updatedAt
+              ) {
+                nodes {
+                  identifier
+                  title
+                  state { name }
+                  labels { nodes { name } }
+                }
+              }
+            }
+          `, { labelName: LINEAR_LABEL });
+
+          const allIssues = debugData.issues.nodes;
+          if (allIssues.length === 0) {
+            log(`Poll #${pollCount}: no issues found with label "${LINEAR_LABEL}" in any status.`);
+          } else {
+            log(`Poll #${pollCount}: all issues with label "${LINEAR_LABEL}":`);
+            for (const issue of allIssues) {
+              const match = issue.state.name === LINEAR_STATUS ? " ← MATCH" : "";
+              log(`  → ${issue.identifier}: ${issue.title} [status: "${issue.state.name}"]${match}`);
+            }
+          }
+        } catch (err) {
+          log(`Poll #${pollCount}: debug query failed: ${err.message}`);
+        }
+      }
+
       const tasks = await fetchPendingTasks();
 
       if (tasks.length === 0) {
-        log(`Poll #${pollCount}: no matching tasks found. Next poll in ${POLL_INTERVAL_MS / 1000}s.`);
+        log(`Poll #${pollCount}: no tasks matching label="${LINEAR_LABEL}" AND status="${LINEAR_STATUS}". Next poll in ${POLL_INTERVAL_MS / 1000}s.`);
       } else {
         log(`Poll #${pollCount}: found ${tasks.length} task(s):`);
         for (const task of tasks) {
