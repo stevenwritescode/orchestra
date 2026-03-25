@@ -24,8 +24,8 @@ RUN apt-get update -qq && apt-get install -y -qq \
     g++ \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Claude Code CLI
-RUN npm install -g @anthropic-ai/claude-code
+# Claude Code CLI is installed at container start (in entrypoint.sh)
+# so that CUSTOM_CA_CERT from the mounted repo is available for npm.
 
 # Install glab CLI (GitLab CLI)
 # Fetch latest version tag from GitLab API, then download the .deb from the

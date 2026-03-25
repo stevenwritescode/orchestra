@@ -188,6 +188,13 @@ async function fetchPendingTasks() {
           project { name }
           team { key }
           url
+          comments {
+            nodes {
+              body
+              user { name }
+              createdAt
+            }
+          }
         }
       }
     }
@@ -370,6 +377,7 @@ ${task.project ? `Project: ${task.project.name}` : ""}
 
 Description:
 ${task.description || "No description provided."}
+${task.comments?.nodes?.length ? `\nComments from the team:\n${task.comments.nodes.map((c) => `[${c.user?.name || "Unknown"}]: ${c.body}`).join("\n\n")}` : ""}
 ${extraPrompt ? `\nAdditional context:\n${extraPrompt}` : ""}
 
 Instructions:

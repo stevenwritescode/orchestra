@@ -106,6 +106,15 @@ if [ -n "${CUSTOM_CA_CERT:-}" ]; then
     fi
 fi
 
+# ─── Install Claude Code CLI ──────────────────────────────────────────────────
+# Done at runtime (not in Dockerfile) so CUSTOM_CA_CERT is available for npm.
+# Skips if already installed (e.g. image was built with it pre-installed).
+if ! command -v claude &>/dev/null; then
+    echo "[entrypoint] Installing Claude Code CLI..."
+    npm install -g @anthropic-ai/claude-code 2>&1 | tail -3
+    echo "[entrypoint] Claude Code CLI installed."
+fi
+
 # ─── Setup git config ───────────────────────────────────────────────────────
 git config --global user.name "claude-task-runner"
 git config --global user.email "claude-task-runner@automated"
