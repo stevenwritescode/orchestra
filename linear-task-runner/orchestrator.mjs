@@ -694,7 +694,16 @@ function cleanupStaging(stagingPath) {
 async function processTask(task) {
   log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
   log(`Processing: ${task.identifier} — ${task.title}`);
+  log(`[${task.identifier}] Description: ${(task.description || "none").slice(0, 200)}${(task.description || "").length > 200 ? "..." : ""}`);
+  if (task.comments?.nodes?.length) {
+    log(`[${task.identifier}] ${task.comments.nodes.length} comment(s) from team:`);
+    for (const c of task.comments.nodes) {
+      log(`[${task.identifier}]   [${c.user?.name || "Unknown"}]: ${c.body.slice(0, 150)}${c.body.length > 150 ? "..." : ""}`);
+    }
+  }
+  log(`[${task.identifier}] Linear URL: ${task.url}`);
 
+  log(`[${task.identifier}] Updating Linear status → In Progress`);
   await updateIssueStatus(task.id, "In Progress");
   await addIssueComment(task.id, `🤖 Automated task runner is working on this.\n\nModel: ${CLAUDE_MODEL}\nMax turns: ${MAX_TURNS}${BACKEND_DOCKER_COMPOSE ? `\nBackend testing: enabled (${BACKEND_SERVICE_NAME})` : ""}`);
 
@@ -890,12 +899,21 @@ async function main() {
   }
 
   // Poll loop
+  let pollCount = 0;
   while (true) {
+    pollCount++;
     try {
+      log(`Poll #${pollCount}: checking Linear for label="${LINEAR_LABEL}" status="${LINEAR_STATUS}"...`);
       const tasks = await fetchPendingTasks();
 
-      if (tasks.length > 0) {
-        log(`Found ${tasks.length} pending task(s)`);
+      if (tasks.length === 0) {
+        log(`Poll #${pollCount}: no matching tasks found. Next poll in ${POLL_INTERVAL_MS / 1000}s.`);
+      } else {
+        log(`Poll #${pollCount}: found ${tasks.length} task(s):`);
+        for (const task of tasks) {
+          const commentCount = task.comments?.nodes?.length || 0;
+          log(`  → ${task.identifier}: ${task.title} (priority: ${task.priority || "none"}, comments: ${commentCount})`);
+        }
 
         for (const task of tasks) {
           await processTask(task);
@@ -903,7 +921,7 @@ async function main() {
         }
       }
     } catch (err) {
-      log(`Error in poll cycle: ${err.message}`);
+      log(`Poll #${pollCount} error: ${err.message}`);
     }
 
     await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
