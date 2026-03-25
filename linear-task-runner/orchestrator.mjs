@@ -588,8 +588,10 @@ function prepareStagingCopy(taskIdentifier) {
   const copyStart = Date.now();
   log(`[${taskIdentifier}] Copying local repo to staging: ${stagingPath}`);
 
-  // cp -r (not -a) so ownership isn't preserved — lets the container chown freely
+  // cp -r (not -a) so ownership isn't preserved, then chmod/chown everything
+  // so the container's claude-runner user (UID 1000) can access all files
   execSync(`cp -r "${LOCAL_REPO_PATH}" "${stagingPath}/repo"`, { stdio: "pipe" });
+  execSync(`chmod -R 777 "${stagingPath}/repo"`, { stdio: "pipe" });
   log(`[${taskIdentifier}] Copy took ${((Date.now() - copyStart) / 1000).toFixed(1)}s`);
 
   // Ensure the remote points to the actual remote, not the local path

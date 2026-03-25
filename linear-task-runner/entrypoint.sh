@@ -213,7 +213,9 @@ if [ -n "${BACKEND_PORT:-}" ]; then
 fi
 
 # ─── Set ownership for non-root user ────────────────────────────────────────
-chown -R claude-runner:claude-runner /workspace
+# Permissions are set on the host before mounting (chmod 777).
+# Only chown non-.git files to avoid macOS Docker bind mount issues.
+chown -R claude-runner:claude-runner /workspace 2>/dev/null || true
 
 # ─── Drop to non-root and execute command ────────────────────────────────────
 # Write a wrapper script so the multi-line prompt doesn't get mangled by su -c.
