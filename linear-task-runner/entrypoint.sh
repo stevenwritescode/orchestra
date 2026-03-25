@@ -228,7 +228,12 @@ WRAPPER_HEAD
 if [ -n "${NODE_EXTRA_CA_CERTS:-}" ]; then
     echo "export NODE_EXTRA_CA_CERTS='${NODE_EXTRA_CA_CERTS}'" >> "$WRAPPER"
 fi
-echo "export ANTHROPIC_API_KEY='${ANTHROPIC_API_KEY}'" >> "$WRAPPER"
+if [ -n "${ANTHROPIC_AUTH_TOKEN:-}" ]; then
+    echo "export ANTHROPIC_AUTH_TOKEN='${ANTHROPIC_AUTH_TOKEN}'" >> "$WRAPPER"
+fi
+if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+    echo "export ANTHROPIC_API_KEY='${ANTHROPIC_API_KEY}'" >> "$WRAPPER"
+fi
 
 if [ "$GIT_PROVIDER" = "github" ]; then
     echo "export GITHUB_TOKEN='${GITHUB_TOKEN}'" >> "$WRAPPER"

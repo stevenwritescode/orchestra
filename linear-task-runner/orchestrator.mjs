@@ -53,10 +53,68 @@ try {
   // linear-oauth.mjs not available — that's fine if using API key
 }
 
+// ─── Claude auth: API key or OAuth from Claude Code login ───────────────────
+// If ANTHROPIC_API_KEY is not set, try to read the OAuth token from Claude
+// Code's stored credentials (macOS Keychain or ~/.claude/.credentials.json).
+// This lets you use your existing Claude login instead of a separate API key.
+function getClaudeOAuthToken() {
+  // Try macOS Keychain first
+  if (process.platform === "darwin") {
+    try {
+      const raw = execSync(
+        'security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null',
+        { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }
+      ).trim();
+      const creds = JSON.parse(raw);
+      const token = creds?.claudeAiOauth?.accessToken;
+      if (token) {
+        log("Using Claude OAuth token from macOS Keychain");
+        return token;
+      }
+    } catch {
+      // Not in Keychain
+    }
+  }
+
+  // Try credentials file (Linux / fallback)
+  const credPaths = [
+    join(process.env.CLAUDE_CONFIG_DIR || "", ".credentials.json"),
+    join(process.env.HOME || "", ".claude", ".credentials.json"),
+  ].filter(Boolean);
+
+  for (const credPath of credPaths) {
+    if (existsSync(credPath)) {
+      try {
+        const creds = JSON.parse(readFileSync(credPath, "utf8"));
+        const token = creds?.claudeAiOauth?.accessToken;
+        if (token) {
+          log(`Using Claude OAuth token from ${credPath}`);
+          return token;
+        }
+      } catch {
+        // Invalid file
+      }
+    }
+  }
+
+  return null;
+}
+
 // ─── Configuration ──────────────────────────────────────────────────────────
 const LINEAR_API_KEY = process.env.LINEAR_API_KEY || "";
 const LINEAR_AUTH_MODE = LINEAR_API_KEY ? "api-key" : "oauth";
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+
+// Auth priority: ANTHROPIC_API_KEY env var → Claude Code OAuth login
+let ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "";
+let ANTHROPIC_AUTH_MODE = "api-key";
+
+if (!ANTHROPIC_API_KEY) {
+  const oauthToken = getClaudeOAuthToken();
+  if (oauthToken) {
+    ANTHROPIC_API_KEY = oauthToken;
+    ANTHROPIC_AUTH_MODE = "oauth";
+  }
+}
 const GIT_PROVIDER = process.env.GIT_PROVIDER || "gitlab";
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN || "";
 const GITHUB_REPO = process.env.GITHUB_REPO || "";
@@ -101,7 +159,9 @@ const LINEAR_LABEL = process.env.LINEAR_LABEL || "autofix";
 const LINEAR_STATUS = process.env.LINEAR_STATUS || "Todo";
 
 if (!ANTHROPIC_API_KEY) {
-  console.error("Missing required env var: ANTHROPIC_API_KEY");
+  console.error("No Anthropic credentials found. Either:");
+  console.error("  1. Set ANTHROPIC_API_KEY in .env");
+  console.error("  2. Log in with: claude login");
   process.exit(1);
 }
 if (GIT_PROVIDER === "github" && (!GITHUB_TOKEN || !GITHUB_REPO)) {
@@ -421,7 +481,10 @@ Example: ${cliExample}`;
       "--rm",
       "--name", containerName,
       "--cap-add=NET_ADMIN",
-      "-e", `ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}`,
+      // Pass Anthropic credentials — use the right env var for the auth mode
+      ...(ANTHROPIC_AUTH_MODE === "oauth"
+        ? ["-e", `ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_API_KEY}`]
+        : ["-e", `ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}`]),
       "-e", `GIT_PROVIDER=${GIT_PROVIDER}`,
       ...(process.env.CUSTOM_CA_CERT ? ["-e", `CUSTOM_CA_CERT=${process.env.CUSTOM_CA_CERT}`] : []),
       "--memory=4g",
@@ -911,6 +974,7 @@ async function main() {
   } else {
     log(`GitLab: ${GITLAB_URL} | Project: ${GITLAB_PROJECT_ID}`);
   }
+  log(`Claude auth: ${ANTHROPIC_AUTH_MODE === "oauth" ? "OAuth (from Claude Code login)" : "API key"}`);
   log(`Linear auth: ${LINEAR_AUTH_MODE === "api-key" ? "API key" : "OAuth (auto-refreshing)"}`);
   log(`Polling every ${POLL_INTERVAL_MS / 1000}s for issues with label="${LINEAR_LABEL}" status="${LINEAR_STATUS}"`);
   log(`Model: ${CLAUDE_MODEL} | Max turns: ${MAX_TURNS} | Timeout: ${TASK_TIMEOUT_MS / 1000}s`);
