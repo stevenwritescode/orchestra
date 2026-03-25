@@ -213,56 +213,30 @@ if [ -n "${BACKEND_PORT:-}" ]; then
 fi
 
 # ─── Set ownership for non-root user ────────────────────────────────────────
-# Try to chown, but don't fail if bind-mounted .git objects resist (macOS Docker quirk).
-# If chown fails, we fall back to running as root (still sandboxed by Docker).
-RUN_AS_ROOT=false
-if ! chown -R claude-runner:claude-runner /workspace 2>/dev/null; then
-    echo "[entrypoint] Could not chown /workspace — running as root (container is sandboxed)"
-    RUN_AS_ROOT=true
-fi
+chown -R claude-runner:claude-runner /workspace
 
-# ─── Drop to non-root (or stay root if chown failed) and execute command ─────
+# ─── Drop to non-root and execute command ────────────────────────────────────
 # Write a wrapper script so the multi-line prompt doesn't get mangled by su -c.
-cd /workspace/repo || exit 1
-
-# Export env vars
-if [ -n "${NODE_EXTRA_CA_CERTS:-}" ]; then
-    export NODE_EXTRA_CA_CERTS
-fi
-if [ -n "${ANTHROPIC_AUTH_TOKEN:-}" ]; then
-    export ANTHROPIC_AUTH_TOKEN
-fi
-if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
-    export ANTHROPIC_API_KEY
-fi
-
-if [ "$GIT_PROVIDER" = "github" ]; then
-    export GITHUB_TOKEN
-    export GH_TOKEN="$GITHUB_TOKEN"
-else
-    export GITLAB_TOKEN
-fi
-
-if [ "$RUN_AS_ROOT" = "true" ]; then
-    exec "$@"
-else
-    # Drop to non-root user, preserving argument boundaries
-    WRAPPER=/tmp/run-as-claude.sh
-    cat > "$WRAPPER" <<'WRAPPER_HEAD'
+WRAPPER=/tmp/run-as-claude.sh
+cat > "$WRAPPER" <<'WRAPPER_HEAD'
 #!/bin/bash
 cd /workspace/repo || exit 1
 WRAPPER_HEAD
 
-    # Pass through all env vars the command needs
-    for var in NODE_EXTRA_CA_CERTS ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY GITHUB_TOKEN GH_TOKEN GITLAB_TOKEN; do
-        if [ -n "${!var:-}" ]; then
-            echo "export ${var}='${!var}'" >> "$WRAPPER"
-        fi
-    done
+# Pass through all env vars the command needs
+for var in NODE_EXTRA_CA_CERTS ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY GITHUB_TOKEN GH_TOKEN GITLAB_TOKEN; do
+    eval "val=\${${var}:-}"
+    if [ -n "$val" ]; then
+        echo "export ${var}='${val}'" >> "$WRAPPER"
+    fi
+done
 
-    echo 'exec "$@"' >> "$WRAPPER"
-    chmod +x "$WRAPPER"
-    chown claude-runner:claude-runner "$WRAPPER"
-
-    exec su - claude-runner -s /bin/bash -- "$WRAPPER" "$@"
+if [ "$GIT_PROVIDER" = "github" ]; then
+    echo "export GH_TOKEN='${GITHUB_TOKEN}'" >> "$WRAPPER"
 fi
+
+echo 'exec "$@"' >> "$WRAPPER"
+chmod +x "$WRAPPER"
+chown claude-runner:claude-runner "$WRAPPER"
+
+exec su - claude-runner -s /bin/bash -- "$WRAPPER" "$@"

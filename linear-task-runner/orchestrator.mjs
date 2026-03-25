@@ -392,8 +392,9 @@ function prepareStagingCopy(taskIdentifier) {
 
   log(`[${taskIdentifier}] Copying local repo to staging: ${stagingPath}`);
 
-  // Use --no-hardlinks so the container can chown the .git objects
-  execSync(`git clone --no-hardlinks "${LOCAL_REPO_PATH}" "${stagingPath}/repo"`, { stdio: "pipe" });
+  // Plain cp instead of git clone — avoids hardlinked .git pack files
+  // that cause chown permission errors in the container
+  execSync(`cp -a "${LOCAL_REPO_PATH}" "${stagingPath}/repo"`, { stdio: "pipe" });
 
   // Ensure the remote points to the actual remote, not the local path
   if (REPO_URL) {
@@ -696,7 +697,7 @@ Example: ${cliExample}`;
     dockerArgs.push(
       DOCKER_IMAGE,
       "claude", "-p", prompt,
-      "--allowedTools", "Read", "Edit", "Write", "Glob", "Grep", "Bash(*)",
+      "--dangerously-skip-permissions",
       "--model", CLAUDE_MODEL,
       "--max-turns", String(MAX_TURNS),
       "--verbose",
