@@ -129,8 +129,8 @@ const LOCAL_REPO_PATH = process.env.LOCAL_REPO_PATH || "";
 
 const DOCKER_IMAGE = process.env.DOCKER_IMAGE || "claude-task-runner";
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "60000");
-const MAX_TURNS = parseInt(process.env.MAX_TURNS || "25");
-const TASK_TIMEOUT_MS = parseInt(process.env.TASK_TIMEOUT_MS || "600000");
+const MAX_TURNS = parseInt(process.env.MAX_TURNS || "50");
+const TASK_TIMEOUT_MS = parseInt(process.env.TASK_TIMEOUT_MS || "1800000"); // 30 min
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "sonnet";
 
 // Backend Docker testing: the orchestrator can build and test your backend
@@ -849,7 +849,18 @@ ${task.project ? `Project: ${task.project.name}` : ""}
 
 Description:
 ${task.description || "No description provided."}
-${task.comments?.nodes?.length ? `\nComments from the team:\n${task.comments.nodes.map((c) => `[${c.user?.name || "Unknown"}]: ${c.body}`).join("\n\n")}` : ""}
+${task.comments?.nodes?.length ? `
+
+════════════════════════════════════════════════════════════
+TEAM COMMENTS — READ THESE CAREFULLY. These contain critical implementation
+instructions, context, and requirements from the team. Follow them precisely.
+════════════════════════════════════════════════════════════
+
+${task.comments.nodes.map((c) => `[${c.user?.name || "Unknown"}]:\n${c.body}`).join("\n\n────────────────────────────────────────\n\n")}
+
+════════════════════════════════════════════════════════════
+END OF TEAM COMMENTS
+════════════════════════════════════════════════════════════` : ""}
 ${extraPrompt ? `\nAdditional context:\n${extraPrompt}` : ""}
 ${scopeInstructions}
 ${imagePromptSection}
