@@ -248,7 +248,11 @@ async function updateIssueStatus(issueId, statusName) {
 }
 
 // ─── Add comment to Linear issue ────────────────────────────────────────────
+// Disabled for now — comments pollute the context pulled from the ticket.
+// Re-enable by removing the early return.
 async function addIssueComment(issueId, body) {
+  return;
+  /* eslint-disable no-unreachable */
   await linearQuery(`
     mutation AddComment($issueId: String!, $body: String!) {
       commentCreate(input: { issueId: $issueId, body: $body }) {
