@@ -882,8 +882,7 @@ async function main() {
   // Build the Docker image first
   log("Building Docker image...");
   try {
-    const caCertArg = process.env.CUSTOM_CA_CERT ? `--build-arg CUSTOM_CA_CERT=${process.env.CUSTOM_CA_CERT}` : "";
-    execSync(`docker build ${caCertArg} -t ${DOCKER_IMAGE} .`, { stdio: "inherit" });
+    execSync(`docker build -t ${DOCKER_IMAGE} "${__dirname}"`, { stdio: "inherit" });
     log("Docker image built successfully.");
   } catch (err) {
     log(`Failed to build Docker image: ${err.message}`);
