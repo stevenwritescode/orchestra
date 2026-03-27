@@ -55,45 +55,63 @@ try {
 
 // ─── Claude auth: API key or OAuth from Claude Code login ───────────────────
 // If ANTHROPIC_API_KEY is not set, try to read the OAuth token from Claude
-// Code's stored credentials (macOS Keychain or ~/.claude/.credentials.json).
-// This lets you use your existing Claude login instead of a separate API key.
+// Code's stored credentials. Checks platform credential stores first, then
+// falls back to the credentials JSON file in common locations.
 function getClaudeOAuthToken() {
-  // Try macOS Keychain first
+  // macOS: read from Keychain
   if (process.platform === "darwin") {
     try {
       const raw = execSync(
         'security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null',
         { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }
       ).trim();
-      const creds = JSON.parse(raw);
-      const token = creds?.claudeAiOauth?.accessToken;
+      const token = JSON.parse(raw)?.claudeAiOauth?.accessToken;
       if (token) {
         log("Using Claude OAuth token from macOS Keychain");
         return token;
       }
-    } catch {
-      // Not in Keychain
-    }
+    } catch { /* not in Keychain */ }
   }
 
-  // Try credentials file (Linux / fallback)
+  // Windows: try Credential Manager via PowerShell
+  // Requires the CredentialManager module: Install-Module CredentialManager
+  if (process.platform === "win32") {
+    try {
+      const raw = execSync(
+        `powershell -NoProfile -Command "` +
+        `(Get-StoredCredential -Target 'Claude Code-credentials').Password | ` +
+        `ConvertFrom-SecureString -AsPlainText"`,
+        { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }
+      ).trim();
+      const token = JSON.parse(raw)?.claudeAiOauth?.accessToken;
+      if (token) {
+        log("Using Claude OAuth token from Windows Credential Manager");
+        return token;
+      }
+    } catch { /* module not installed or credential not found */ }
+  }
+
+  // All platforms: fall back to credentials file in common locations
+  const home = process.env.HOME || process.env.USERPROFILE || "";
   const credPaths = [
-    join(process.env.CLAUDE_CONFIG_DIR || "", ".credentials.json"),
-    join(process.env.HOME || "", ".claude", ".credentials.json"),
+    // Explicit override
+    process.env.CLAUDE_CONFIG_DIR && join(process.env.CLAUDE_CONFIG_DIR, ".credentials.json"),
+    // Standard location (macOS/Linux)
+    home && join(home, ".claude", ".credentials.json"),
+    // Windows: Electron app data
+    process.env.APPDATA && join(process.env.APPDATA, "Claude Code", ".credentials.json"),
+    process.env.LOCALAPPDATA && join(process.env.LOCALAPPDATA, "Claude Code", ".credentials.json"),
   ].filter(Boolean);
 
   for (const credPath of credPaths) {
     if (existsSync(credPath)) {
       try {
-        const creds = JSON.parse(readFileSync(credPath, "utf8"));
-        const token = creds?.claudeAiOauth?.accessToken;
+        const token = JSON.parse(readFileSync(credPath, "utf8"))?.claudeAiOauth?.accessToken;
         if (token) {
           log(`Using Claude OAuth token from ${credPath}`);
           return token;
         }
-      } catch {
-        // Invalid file
-      }
+      } catch { /* invalid JSON or missing field */ }
     }
   }
 
@@ -224,8 +242,12 @@ const LINEAR_STATUSES = LINEAR_STATUS_RAW.split(",").map((s) => s.trim()).filter
 
 if (!ANTHROPIC_API_KEY) {
   console.error("No Anthropic credentials found. Either:");
-  console.error("  1. Set ANTHROPIC_API_KEY in .env");
-  console.error("  2. Log in with: claude login");
+  console.error("  1. Set ANTHROPIC_API_KEY in .env  (works on all platforms)");
+  console.error("  2. Log in with: claude login  (macOS/Linux)");
+  if (process.platform === "win32") {
+    console.error("  3. Windows: install CredentialManager module and log in with claude login:");
+    console.error("     Install-Module CredentialManager -Scope CurrentUser");
+  }
   process.exit(1);
 }
 if (GIT_PROVIDER === "github" && (!GITHUB_TOKEN || !GITHUB_REPO)) {
@@ -726,7 +748,9 @@ Instructions:
    git add -A && git commit -m "${task.identifier}: address review feedback (round ${round})" && git push origin ${branchName}
 5. Only address what reviewers asked for — do not make unrelated changes
 6. If a comment is just approval/praise with no action needed, skip it
-7. Use ${GIT_PROVIDER === "github" ? "gh" : "glab"} CLI for any ${GIT_PROVIDER === "github" ? "GitHub" : "GitLab"} operations — do NOT make direct API calls`;
+7. Use ${GIT_PROVIDER === "github" ? "gh" : "glab"} CLI for any ${GIT_PROVIDER === "github" ? "GitHub" : "GitLab"} operations — do NOT make direct API calls
+8. Use targeted file reads (specific line ranges + grep) to conserve context. Delegate
+   independent changes to sub-agents via the Task tool — tell them the branch is "${branchName}"`;
 
     // Spawn a revision container
     const revisionOutcome = await runInContainer(task, revisionPrompt);
@@ -981,11 +1005,26 @@ ${extraPrompt ? `\nAdditional context:\n${extraPrompt}` : ""}
 ${scopeInstructions}
 ${imagePromptSection}
 ${buildSkillsPromptSection(task)}
+════════════════════════════════════════════════════════════
+CONTEXT & SUB-AGENTS
+════════════════════════════════════════════════════════════
+You are running in a long-lived container with a finite context window. Manage it carefully:
+- Use targeted reads: read specific line ranges, not entire files. Use grep/search first.
+- Summarise tool output mentally — do not re-read results you already processed.
+- If a task has multiple independent parts (separate files, separate features), delegate
+  each part to a sub-agent using the Task tool. Sub-agents get a fresh context window
+  and run concurrently. Always tell them: the working branch is "${branchName}", and they
+  should commit and push their changes when done.
+- Use sub-agents for expensive exploration too: "search the codebase for X and return
+  the relevant file paths and line numbers" is a good sub-agent task.
+════════════════════════════════════════════════════════════
+
 Instructions:
 1. FIRST: Create and switch to branch "${branchName}" immediately:
    git checkout -b ${branchName}
    This must be done BEFORE any other work so nothing is lost.
-2. Read the codebase to understand the relevant code
+2. Read the codebase to understand the relevant code — use targeted reads and grep,
+   not full-file reads
 3. Implement the requested changes following this save pattern:
    - After every meaningful change (new function, fixed bug, added test, etc.), commit AND push:
      git add -A && git commit -m "${task.identifier}: [what you just did]" && git push -u origin ${branchName}
