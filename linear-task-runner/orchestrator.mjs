@@ -424,6 +424,38 @@ async function gitApi(method, path, body = null) {
   return JSON.parse(text);
 }
 
+// ─── Create an MR/PR via API (fallback when Claude didn't do it) ─────────────
+async function createMR(task, branchName) {
+  const title = `Draft: ${task.identifier} ${task.title}`;
+  const body = `Automated implementation of ${task.identifier}.\n\n${task.url}`;
+  try {
+    if (GIT_PROVIDER === "github") {
+      const pr = await gitApi("POST", "/pulls", {
+        head: branchName,
+        base: DEFAULT_BRANCH,
+        title,
+        body,
+        draft: true,
+      });
+      log(`[${task.identifier}] Orchestrator created PR: ${pr.html_url}`);
+      return { web_url: pr.html_url, title: pr.title, number: pr.number };
+    } else {
+      const mr = await gitApi("POST", "/merge_requests", {
+        source_branch: branchName,
+        target_branch: DEFAULT_BRANCH,
+        title,
+        description: body,
+        draft: true,
+      });
+      log(`[${task.identifier}] Orchestrator created MR: ${mr.web_url}`);
+      return mr;
+    }
+  } catch (err) {
+    log(`[${task.identifier}] Could not auto-create MR: ${err.message}`);
+    return null;
+  }
+}
+
 // ─── Check if an MR/PR exists for this task ─────────────────────────────────
 async function checkForMR(taskIdentifier) {
   try {
@@ -609,7 +641,8 @@ Instructions:
 4. After each fix, commit and push immediately:
    git add -A && git commit -m "${task.identifier}: address review feedback (round ${round})" && git push origin ${branchName}
 5. Only address what reviewers asked for — do not make unrelated changes
-6. If a comment is just approval/praise with no action needed, skip it`;
+6. If a comment is just approval/praise with no action needed, skip it
+7. Use ${GIT_PROVIDER === "github" ? "gh" : "glab"} CLI for any ${GIT_PROVIDER === "github" ? "GitHub" : "GitLab"} operations — do NOT make direct API calls`;
 
     // Spawn a revision container
     const revisionOutcome = await runInContainer(task, revisionPrompt);
@@ -884,7 +917,13 @@ Commit message format: ${task.identifier}: [short description]
 ${mrTerm.charAt(0).toUpperCase() + mrTerm.slice(1)} title format: ${draftTitle}
 
 Use ${cliName} CLI to create the ${mrTerm}. Link it to the task by including "${task.url}" in the ${mrTerm} body.
-Example: ${cliExample}`;
+Example: ${cliExample}
+
+IMPORTANT: For all ${GIT_PROVIDER === "github" ? "GitHub" : "GitLab"} operations (reading MRs/PRs, creating branches, etc.) use the ${cliName} CLI — do NOT make direct API calls. The CLI is already authenticated via the token in the environment.${GIT_PROVIDER === "gitlab" ? `
+To read an existing MR: glab mr view <iid>
+To list MRs: glab mr list` : `
+To read an existing PR: gh pr view <number>
+To list PRs: gh pr list`}`;
 
     const dockerArgs = [
       "run",
@@ -1420,19 +1459,23 @@ The orchestrator will re-run the backend tests after you commit.`;
     }
 
     // ── Phase 3: Check for MR and enter review loop ─────────────────────
-    const mr = await checkForMR(task.identifier);
+    const branchName = `task/${task.identifier.toLowerCase()}`;
+    let mr = await checkForMR(task.identifier);
+
+    // If Claude exited cleanly but didn't create an MR, create one via API
+    if (!mr && outcome.exitCode === 0) {
+      log(`[${task.identifier}] No MR found after successful run — creating via API`);
+      mr = await createMR(task, branchName);
+    }
 
     if (mr) {
-      log(`[${task.identifier}] MR created: ${mr.web_url}`);
+      log(`[${task.identifier}] MR ready: ${mr.web_url}`);
       await updateIssueStatus(task.id, "In Review");
+      await addIssueComment(task.id, `🔗 ${GIT_PROVIDER === "github" ? "PR" : "MR"} created: ${mr.web_url}`);
 
       // Enter the review feedback loop — polls for comments and addresses them
       const reviewResult = await reviewFeedbackLoop(task, mr, lastStagingPath);
       log(`[${task.identifier}] Review loop ended: ${reviewResult}`);
-
-    } else if (outcome.exitCode === 0) {
-      log(`[${task.identifier}] Completed but no MR created.`);
-      await updateIssueStatus(task.id, "Todo");
 
     } else {
       await updateIssueStatus(task.id, "Todo");
