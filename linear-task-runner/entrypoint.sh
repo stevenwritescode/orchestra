@@ -220,8 +220,11 @@ chown -R claude-runner:claude-runner /workspace 2>/dev/null || true
 # ─── Drop to non-root and execute command ────────────────────────────────────
 # Write a wrapper script so the multi-line prompt doesn't get mangled by su -c.
 WRAPPER=/tmp/run-as-claude.sh
-cat > "$WRAPPER" <<'WRAPPER_HEAD'
+CLAUDE_BIN=$(which claude 2>/dev/null || echo "")
+CLAUDE_BIN_DIR=$(dirname "$CLAUDE_BIN" 2>/dev/null || echo "")
+cat > "$WRAPPER" <<WRAPPER_HEAD
 #!/bin/bash
+export PATH="${CLAUDE_BIN_DIR}:${PATH}"
 cd /workspace/repo || exit 1
 WRAPPER_HEAD
 
