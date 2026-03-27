@@ -181,11 +181,16 @@ get_authed_url() {
 if [ "${SKIP_CLONE:-0}" = "1" ] && [ -d "/workspace/repo/.git" ]; then
     echo "[entrypoint] Using bind-mounted repo (SKIP_CLONE=1)."
 
-    # Configure the remote to use authenticated URL for push
-    if [ -n "$REPO_URL" ] && [[ "$REPO_URL" == https://* ]]; then
-        AUTHED_URL=$(get_authed_url "$REPO_URL")
-        if [ "$AUTHED_URL" != "$REPO_URL" ]; then
+    # Configure the remote to use authenticated URL for push.
+    # Fall back to reading the existing remote URL if REPO_URL wasn't passed.
+    EFFECTIVE_REPO_URL="${REPO_URL:-$(git -C /workspace/repo remote get-url origin 2>/dev/null || echo '')}"
+    if [ -n "$EFFECTIVE_REPO_URL" ] && [[ "$EFFECTIVE_REPO_URL" == https://* ]]; then
+        AUTHED_URL=$(get_authed_url "$EFFECTIVE_REPO_URL")
+        if [ "$AUTHED_URL" != "$EFFECTIVE_REPO_URL" ]; then
             git -C /workspace/repo remote set-url origin "$AUTHED_URL" 2>/dev/null || true
+            echo "[entrypoint] Push auth configured for ${GIT_PROVIDER}."
+        else
+            echo "[entrypoint] WARNING: Push auth not configured — token missing or GIT_PROVIDER mismatch (provider=${GIT_PROVIDER:-unset})."
         fi
     fi
 elif [ -n "$REPO_URL" ] && [ ! -d "/workspace/repo/.git" ]; then
@@ -213,9 +218,14 @@ if [ -n "${BACKEND_PORT:-}" ]; then
 fi
 
 # ─── Set ownership for non-root user ────────────────────────────────────────
-# Permissions are set on the host before mounting (chmod 777).
-# Only chown non-.git files to avoid macOS Docker bind mount issues.
-chown -R claude-runner:claude-runner /workspace 2>/dev/null || true
+# When SKIP_CLONE=1 the repo is bind-mounted from the host — chowning it
+# is unnecessary and extremely slow on macOS Docker bind mounts.
+# Only chown workspace artifacts created inside the container.
+if [ "${SKIP_CLONE:-0}" = "1" ]; then
+    chown -R claude-runner:claude-runner /workspace/signals 2>/dev/null || true
+else
+    chown -R claude-runner:claude-runner /workspace 2>/dev/null || true
+fi
 
 # ─── Drop to non-root and execute command ────────────────────────────────────
 # Write a wrapper script so the multi-line prompt doesn't get mangled by su -c.
