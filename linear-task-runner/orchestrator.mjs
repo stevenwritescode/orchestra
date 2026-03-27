@@ -132,6 +132,7 @@ const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "60000");
 const MAX_TURNS = parseInt(process.env.MAX_TURNS || "50");
 const TASK_TIMEOUT_MS = parseInt(process.env.TASK_TIMEOUT_MS || "1800000"); // 30 min
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "sonnet";
+const DEFAULT_BRANCH = process.env.DEFAULT_BRANCH || "main";
 
 // Backend Docker testing: the orchestrator can build and test your backend
 // container after the agent makes changes, then feed results back.
@@ -654,15 +655,9 @@ function prepareStagingCopy(taskIdentifier) {
   const repoDir = `${stagingPath}/repo`;
   try {
     execSync(`git -C "${repoDir}" fetch origin`, { stdio: "pipe" });
-    // Try main first, fall back to master
-    try {
-      execSync(`git -C "${repoDir}" checkout main`, { stdio: "pipe" });
-      execSync(`git -C "${repoDir}" reset --hard origin/main`, { stdio: "pipe" });
-    } catch {
-      execSync(`git -C "${repoDir}" checkout master`, { stdio: "pipe" });
-      execSync(`git -C "${repoDir}" reset --hard origin/master`, { stdio: "pipe" });
-    }
-    log(`[${taskIdentifier}] Staging repo reset to latest main`);
+    execSync(`git -C "${repoDir}" checkout ${DEFAULT_BRANCH}`, { stdio: "pipe" });
+    execSync(`git -C "${repoDir}" reset --hard origin/${DEFAULT_BRANCH}`, { stdio: "pipe" });
+    log(`[${taskIdentifier}] Staging repo reset to latest ${DEFAULT_BRANCH}`);
   } catch (err) {
     log(`[${taskIdentifier}] Warning: could not reset to main: ${err.message}`);
   }

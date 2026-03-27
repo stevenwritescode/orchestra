@@ -74,6 +74,7 @@ const DOCKER_IMAGE = process.env.DOCKER_IMAGE || "claude-task-runner";
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "sonnet";
 const MAX_TURNS = parseInt(process.env.MAX_TURNS || "50");
 const TASK_TIMEOUT_MS = parseInt(process.env.TASK_TIMEOUT_MS || "1800000");
+const DEFAULT_BRANCH = process.env.DEFAULT_BRANCH || "main";
 const STAGING_DIR = process.env.STAGING_DIR || "/tmp/task-staging";
 
 function ts() {
@@ -215,11 +216,7 @@ function prepareStagingCopy(label) {
   }
   try {
     execSync(`git -C "${repoDir}" fetch origin`, { stdio: "pipe" });
-    try {
-      execSync(`git -C "${repoDir}" checkout main && git -C "${repoDir}" reset --hard origin/main`, { stdio: "pipe" });
-    } catch {
-      execSync(`git -C "${repoDir}" checkout master && git -C "${repoDir}" reset --hard origin/master`, { stdio: "pipe" });
-    }
+    execSync(`git -C "${repoDir}" checkout ${DEFAULT_BRANCH} && git -C "${repoDir}" reset --hard origin/${DEFAULT_BRANCH}`, { stdio: "pipe" });
   } catch (err) {
     log(`Warning: could not reset to main: ${err.message}`);
   }
