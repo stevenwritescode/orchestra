@@ -187,12 +187,19 @@ else
 hosts:
   ${GITLAB_HOST}:
     token: ${GITLAB_TOKEN}
-    api_host: ${GITLAB_HOST}
+    api_protocol: https
     git_protocol: https
 GLABEOF
         chown -R claude-runner:claude-runner /home/claude-runner/.config
 
         echo "[entrypoint] glab CLI configured for ${GITLAB_HOST}."
+
+        # Verify glab can actually authenticate (catches bad tokens early)
+        if glab auth status 2>&1 | grep -q "Logged in"; then
+            echo "[entrypoint] glab auth verified."
+        else
+            echo "[entrypoint] WARNING: glab auth check failed — API calls from Claude may get 403s."
+        fi
     fi
 fi
 

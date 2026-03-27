@@ -16,7 +16,7 @@
 
 import { execSync, spawn } from "child_process";
 import { randomUUID } from "crypto";
-import { existsSync, mkdirSync, cpSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, cpSync, readFileSync, writeFileSync, readdirSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath, pathToFileURL } from "url";
 
@@ -160,6 +160,11 @@ const REVIEW_WAIT_TIMEOUT_MS = parseInt(process.env.REVIEW_WAIT_TIMEOUT_MS || "3
 
 // Concurrency: how many tasks to work on simultaneously
 const MAX_CONCURRENT_TASKS = parseInt(process.env.MAX_CONCURRENT_TASKS || "3");
+
+// Skills: path to a directory of Claude Code skill markdown files.
+// All skills are mounted into the container and Claude is informed which are
+// relevant to the task at hand.
+const CLAUDE_SKILLS_DIR = process.env.CLAUDE_SKILLS_DIR || "";
 
 // Staging directory for extracting agent changes before backend testing
 const STAGING_DIR = process.env.STAGING_DIR || "/tmp/task-staging";
@@ -387,6 +392,85 @@ async function addIssueComment(issueId, body) {
       }
     }
   `, { issueId, body });
+}
+
+// ─── Skills loader ───────────────────────────────────────────────────────────
+// Reads all .md files from CLAUDE_SKILLS_DIR and parses their frontmatter.
+// Returns an array of { name, description, file } objects.
+function loadSkills() {
+  if (!CLAUDE_SKILLS_DIR || !existsSync(CLAUDE_SKILLS_DIR)) return [];
+  try {
+    return readdirSync(CLAUDE_SKILLS_DIR)
+      .filter((f) => f.endsWith(".md"))
+      .map((f) => {
+        const content = readFileSync(join(CLAUDE_SKILLS_DIR, f), "utf8");
+        const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
+        const fm = fmMatch ? fmMatch[1] : "";
+        const nameMatch = fm.match(/^name:\s*(.+)$/m);
+        const descMatch = fm.match(/^description:\s*(.+)$/m);
+        const name = nameMatch ? nameMatch[1].trim() : f.replace(/\.md$/, "");
+        const description = descMatch ? descMatch[1].trim() : "";
+        return { name, description, file: f };
+      })
+      .filter((s) => s.name);
+  } catch (err) {
+    log(`[skills] Failed to load skills: ${err.message}`);
+    return [];
+  }
+}
+
+// Score a skill's relevance to a task. Returns a positive number if relevant.
+// Matches against task labels, project name, and title keywords.
+function scoreSkillRelevance(skill, task) {
+  const haystack = [
+    skill.name,
+    skill.description,
+    skill.file,
+  ].join(" ").toLowerCase();
+
+  const needles = [
+    ...(task.labels?.nodes?.map((l) => l.name) || []),
+    task.project?.name || "",
+    task.title || "",
+  ].join(" ").toLowerCase().split(/\W+/).filter((w) => w.length > 2);
+
+  return needles.filter((w) => haystack.includes(w)).length;
+}
+
+// Build the skills prompt section for a task.
+function buildSkillsPromptSection(task) {
+  const skills = loadSkills();
+  if (skills.length === 0) return "";
+
+  const scored = skills
+    .map((s) => ({ ...s, score: scoreSkillRelevance(s, task) }))
+    .sort((a, b) => b.score - a.score);
+
+  const relevant = scored.filter((s) => s.score > 0);
+  const other = scored.filter((s) => s.score === 0);
+
+  const fmt = (s) => `  /${s.name}${s.description ? ` — ${s.description}` : ""}`;
+
+  const lines = [
+    "════════════════════════════════════════════════════════════",
+    "AVAILABLE SKILLS",
+    "The following Claude Code skills are installed. Invoke relevant ones",
+    "early in your session using /<skill-name>.",
+    "════════════════════════════════════════════════════════════",
+  ];
+
+  if (relevant.length > 0) {
+    lines.push("", "LIKELY RELEVANT TO THIS TASK:");
+    relevant.forEach((s) => lines.push(fmt(s)));
+  }
+
+  if (other.length > 0) {
+    lines.push("", "OTHER AVAILABLE SKILLS:");
+    other.forEach((s) => lines.push(fmt(s)));
+  }
+
+  lines.push("════════════════════════════════════════════════════════════");
+  return "\n" + lines.join("\n");
 }
 
 // ─── Git Provider API helper ────────────────────────────────────────────────
@@ -896,7 +980,7 @@ END OF TEAM COMMENTS
 ${extraPrompt ? `\nAdditional context:\n${extraPrompt}` : ""}
 ${scopeInstructions}
 ${imagePromptSection}
-
+${buildSkillsPromptSection(task)}
 Instructions:
 1. FIRST: Create and switch to branch "${branchName}" immediately:
    git checkout -b ${branchName}
@@ -973,6 +1057,11 @@ To list PRs: gh pr list`}`;
     // Mount images directory if we downloaded any
     if (downloadedImages.length > 0) {
       dockerArgs.push("-v", `${imagesDir}:/workspace/images:ro`);
+    }
+
+    // Mount skills directory so Claude can invoke skills as /skill-name commands
+    if (CLAUDE_SKILLS_DIR && existsSync(CLAUDE_SKILLS_DIR)) {
+      dockerArgs.push("-v", `${CLAUDE_SKILLS_DIR}:/home/claude-runner/.claude/commands:ro`);
     }
 
     // Live backend access: let the agent reach the backend on the host
