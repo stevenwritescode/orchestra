@@ -17,7 +17,7 @@
 
 import { execSync, spawn } from "child_process";
 import { randomUUID } from "crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath, pathToFileURL } from "url";
 import { createInterface } from "readline";
@@ -76,6 +76,7 @@ const MAX_TURNS = parseInt(process.env.MAX_TURNS || "50");
 const TASK_TIMEOUT_MS = parseInt(process.env.TASK_TIMEOUT_MS || "1800000");
 const DEFAULT_BRANCH = process.env.DEFAULT_BRANCH || "main";
 const STAGING_DIR = process.env.STAGING_DIR || "/tmp/task-staging";
+const CLAUDE_SKILLS_DIR = process.env.CLAUDE_SKILLS_DIR || "";
 
 function ts() {
   return new Date().toISOString().slice(0, 19);
@@ -86,14 +87,14 @@ function log(msg) {
 
 // ─── Claude auth ────────────────────────────────────────────────────────────
 function getClaudeOAuthToken() {
+  // macOS: read from Keychain
   if (process.platform === "darwin") {
     try {
       const raw = execSync(
         'security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null',
         { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }
       ).trim();
-      const creds = JSON.parse(raw);
-      const token = creds?.claudeAiOauth?.accessToken;
+      const token = JSON.parse(raw)?.claudeAiOauth?.accessToken;
       if (token) {
         log("Auth: using Claude OAuth token from macOS Keychain");
         return token;
@@ -101,16 +102,37 @@ function getClaudeOAuthToken() {
     } catch {}
   }
 
+  // Windows: try Credential Manager via PowerShell
+  // Requires the CredentialManager module: Install-Module CredentialManager
+  if (process.platform === "win32") {
+    try {
+      const raw = execSync(
+        `powershell -NoProfile -Command "` +
+        `(Get-StoredCredential -Target 'Claude Code-credentials').Password | ` +
+        `ConvertFrom-SecureString -AsPlainText"`,
+        { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }
+      ).trim();
+      const token = JSON.parse(raw)?.claudeAiOauth?.accessToken;
+      if (token) {
+        log("Auth: using Claude OAuth token from Windows Credential Manager");
+        return token;
+      }
+    } catch {}
+  }
+
+  // All platforms: fall back to credentials file in common locations
+  const home = process.env.HOME || process.env.USERPROFILE || "";
   const credPaths = [
-    join(process.env.CLAUDE_CONFIG_DIR || "", ".credentials.json"),
-    join(process.env.HOME || "", ".claude", ".credentials.json"),
+    process.env.CLAUDE_CONFIG_DIR && join(process.env.CLAUDE_CONFIG_DIR, ".credentials.json"),
+    home && join(home, ".claude", ".credentials.json"),
+    process.env.APPDATA && join(process.env.APPDATA, "Claude Code", ".credentials.json"),
+    process.env.LOCALAPPDATA && join(process.env.LOCALAPPDATA, "Claude Code", ".credentials.json"),
   ].filter(Boolean);
 
   for (const p of credPaths) {
     if (existsSync(p)) {
       try {
-        const creds = JSON.parse(readFileSync(p, "utf8"));
-        const token = creds?.claudeAiOauth?.accessToken;
+        const token = JSON.parse(readFileSync(p, "utf8"))?.claudeAiOauth?.accessToken;
         if (token) {
           log(`Auth: using Claude OAuth token from ${p}`);
           return token;
@@ -281,6 +303,66 @@ function rescueUnpushedWork(stagingPath) {
   }
 }
 
+// ─── Skills loader ───────────────────────────────────────────────────────────
+function loadSkills() {
+  if (!CLAUDE_SKILLS_DIR || !existsSync(CLAUDE_SKILLS_DIR)) return [];
+  try {
+    return readdirSync(CLAUDE_SKILLS_DIR)
+      .filter((f) => f.endsWith(".md"))
+      .map((f) => {
+        const content = readFileSync(join(CLAUDE_SKILLS_DIR, f), "utf8");
+        const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
+        const fm = fmMatch ? fmMatch[1] : "";
+        const nameMatch = fm.match(/^name:\s*(.+)$/m);
+        const descMatch = fm.match(/^description:\s*(.+)$/m);
+        const name = nameMatch ? nameMatch[1].trim() : f.replace(/\.md$/, "");
+        const description = descMatch ? descMatch[1].trim() : "";
+        return { name, description, file: f };
+      })
+      .filter((s) => s.name);
+  } catch (err) {
+    log(`Skills: failed to load — ${err.message}`);
+    return [];
+  }
+}
+
+function buildSkillsPromptSection(instructions) {
+  const skills = loadSkills();
+  if (skills.length === 0) return "";
+
+  // Score relevance against the instructions text
+  const needles = instructions.toLowerCase().split(/\W+/).filter((w) => w.length > 2);
+  const scored = skills
+    .map((s) => {
+      const haystack = [s.name, s.description, s.file].join(" ").toLowerCase();
+      const score = needles.filter((w) => haystack.includes(w)).length;
+      return { ...s, score };
+    })
+    .sort((a, b) => b.score - a.score);
+
+  const relevant = scored.filter((s) => s.score > 0);
+  const other = scored.filter((s) => s.score === 0);
+  const fmt = (s) => `  /${s.name}${s.description ? ` — ${s.description}` : ""}`;
+
+  const lines = [
+    "════════════════════════════════════════════════════════════",
+    "AVAILABLE SKILLS",
+    "The following Claude Code skills are installed. Invoke relevant ones",
+    "early in your session using /<skill-name>.",
+    "════════════════════════════════════════════════════════════",
+  ];
+  if (relevant.length > 0) {
+    lines.push("", "LIKELY RELEVANT TO THIS TASK:");
+    relevant.forEach((s) => lines.push(fmt(s)));
+  }
+  if (other.length > 0) {
+    lines.push("", "OTHER AVAILABLE SKILLS:");
+    other.forEach((s) => lines.push(fmt(s)));
+  }
+  lines.push("════════════════════════════════════════════════════════════");
+  return "\n" + lines.join("\n");
+}
+
 // ─── Run container ──────────────────────────────────────────────────────────
 function runContainer(opts) {
   return new Promise((resolve, reject) => {
@@ -296,10 +378,21 @@ function runContainer(opts) {
     const prompt = `You are an autonomous developer working on a task.
 
 ${instructions}
+${buildSkillsPromptSection(instructions)}
+════════════════════════════════════════════════════════════
+CONTEXT & SUB-AGENTS
+════════════════════════════════════════════════════════════
+You are running in a container with a finite context window. Manage it carefully:
+- Use targeted reads: read specific line ranges, not entire files. Use grep/search first.
+- Summarise tool output mentally — do not re-read results you already processed.
+- Delegate independent subtasks to sub-agents using the Task tool. Sub-agents get a
+  fresh context window. Always tell them the working branch is "${branch}".
+════════════════════════════════════════════════════════════
 
 Instructions:
 ${branchInstruction}
-2. Read the codebase to understand the relevant code
+2. Read the codebase to understand the relevant code — use targeted reads and grep,
+   not full-file reads
 3. Implement the requested changes following this save pattern:
    - After every meaningful change, commit AND push:
      git add -A && git commit -m "[what you just did]" && git push -u origin ${branch}
@@ -308,7 +401,8 @@ ${branchInstruction}
 4. Write or update tests if appropriate
 5. Run the existing test suite to verify nothing is broken
 6. If you cannot complete the task, still commit and push whatever progress you've made with a WIP commit
-7. Optionally create a draft ${mrTerm} using ${cliName} CLI if the work is ready for review`;
+7. Optionally create a draft ${mrTerm} using ${cliName} CLI if the work is ready for review
+8. Use ${cliName} CLI for all ${GIT_PROVIDER === "github" ? "GitHub" : "GitLab"} operations — do NOT make direct API calls`;
 
     const dockerArgs = [
       "run", "--rm",
@@ -347,6 +441,10 @@ ${branchInstruction}
 
     if (process.env.CUSTOM_CA_CERT) {
       dockerArgs.push("-e", `CUSTOM_CA_CERT=${process.env.CUSTOM_CA_CERT}`);
+    }
+
+    if (CLAUDE_SKILLS_DIR && existsSync(CLAUDE_SKILLS_DIR)) {
+      dockerArgs.push("-v", `${CLAUDE_SKILLS_DIR}:/home/claude-runner/.claude/commands:ro`);
     }
 
     dockerArgs.push(
