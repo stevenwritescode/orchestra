@@ -597,9 +597,13 @@ async function fetchReviewComments(mrId, lastCheckedAt) {
 
       for (const c of [...reviewComments, ...issueComments]) {
         if (lastCheckedAt && new Date(c.created_at) <= new Date(lastCheckedAt)) continue;
-        // Skip bot comments
+        // Skip bot/automation comments that shouldn't trigger revision rounds.
+        // Intentionally allow coderabbit-ai (useful review feedback).
         const login = c.user?.login?.toLowerCase() || "";
-        if (login.includes("bot") || login.includes("claude") || login === "github-actions[bot]") continue;
+        const isBot = login === "github-actions[bot]"
+          || login.endsWith("[bot]")
+          || login.includes("claude");
+        if (isBot) continue;
         comments.push({
           author: c.user?.login || "unknown",
           body: c.body,
@@ -616,9 +620,13 @@ async function fetchReviewComments(mrId, lastCheckedAt) {
         for (const note of disc.notes) {
           if (note.system) continue;
           if (lastCheckedAt && new Date(note.created_at) <= new Date(lastCheckedAt)) continue;
-          // Skip bot comments
+          // Skip bot/automation comments that shouldn't trigger revision rounds.
+          // Intentionally allow coderabbitai (useful review feedback).
           const username = note.author?.username?.toLowerCase() || "";
-          if (username.includes("bot") || username.includes("claude")) continue;
+          const isBot = username.includes("claude")
+            || username.endsWith("_bot")
+            || username === "ghost";
+          if (isBot) continue;
           // Skip resolved threads
           if (note.resolvable && note.resolved) continue;
           comments.push({
