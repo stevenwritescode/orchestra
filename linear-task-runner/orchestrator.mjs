@@ -654,9 +654,13 @@ function prepareStagingCopy(taskIdentifier) {
   // Always start from the latest main/master regardless of what branch was checked out locally
   const repoDir = `${stagingPath}/repo`;
   try {
+    // Clean everything first — local changes from the copied repo would block checkout
+    execSync(`git -C "${repoDir}" reset --hard HEAD`, { stdio: "pipe" });
+    execSync(`git -C "${repoDir}" clean -fd`, { stdio: "pipe" });
     execSync(`git -C "${repoDir}" fetch origin`, { stdio: "pipe" });
     execSync(`git -C "${repoDir}" checkout ${DEFAULT_BRANCH}`, { stdio: "pipe" });
     execSync(`git -C "${repoDir}" reset --hard origin/${DEFAULT_BRANCH}`, { stdio: "pipe" });
+    execSync(`git -C "${repoDir}" clean -fd`, { stdio: "pipe" });
     log(`[${taskIdentifier}] Staging repo reset to latest ${DEFAULT_BRANCH}`);
   } catch (err) {
     log(`[${taskIdentifier}] Warning: could not reset to main: ${err.message}`);

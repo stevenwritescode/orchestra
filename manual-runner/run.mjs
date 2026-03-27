@@ -215,8 +215,12 @@ function prepareStagingCopy(label) {
     } catch {}
   }
   try {
+    execSync(`git -C "${repoDir}" reset --hard HEAD`, { stdio: "pipe" });
+    execSync(`git -C "${repoDir}" clean -fd`, { stdio: "pipe" });
     execSync(`git -C "${repoDir}" fetch origin`, { stdio: "pipe" });
-    execSync(`git -C "${repoDir}" checkout ${DEFAULT_BRANCH} && git -C "${repoDir}" reset --hard origin/${DEFAULT_BRANCH}`, { stdio: "pipe" });
+    execSync(`git -C "${repoDir}" checkout ${DEFAULT_BRANCH}`, { stdio: "pipe" });
+    execSync(`git -C "${repoDir}" reset --hard origin/${DEFAULT_BRANCH}`, { stdio: "pipe" });
+    execSync(`git -C "${repoDir}" clean -fd`, { stdio: "pipe" });
   } catch (err) {
     log(`Warning: could not reset to main: ${err.message}`);
   }
