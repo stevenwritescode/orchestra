@@ -14,6 +14,30 @@
 
 set -e
 
+# ─── Progress timer helper ────────────────────────────────────────────────────
+# Usage: start_timer "label"  → prints "label... Xs elapsed" every 5s
+#        stop_timer           → kills the background timer
+_TIMER_PID=""
+start_timer() {
+    local label="$1"
+    (
+        local elapsed=0
+        while true; do
+            sleep 5
+            elapsed=$((elapsed + 5))
+            echo "[entrypoint] ${label}... ${elapsed}s elapsed"
+        done
+    ) &
+    _TIMER_PID=$!
+}
+stop_timer() {
+    if [ -n "$_TIMER_PID" ]; then
+        kill "$_TIMER_PID" 2>/dev/null || true
+        wait "$_TIMER_PID" 2>/dev/null || true
+        _TIMER_PID=""
+    fi
+}
+
 # ─── Resolve Docker host gateway IP ─────────────────────────────────────────
 # The agent needs to reach the backend container running on the host.
 # Docker provides host.docker.internal on Docker Desktop, but on Linux
@@ -120,6 +144,13 @@ git config --global user.name "${GIT_USER_NAME:-claude-task-runner}"
 git config --global user.email "${GIT_USER_EMAIL:-claude-task-runner@automated}"
 git config --global init.defaultBranch main
 
+# Export git identity as env vars so they override any `git config user.*`
+# changes Claude may make during task execution.
+export GIT_AUTHOR_NAME="${GIT_USER_NAME:-claude-task-runner}"
+export GIT_AUTHOR_EMAIL="${GIT_USER_EMAIL:-claude-task-runner@automated}"
+export GIT_COMMITTER_NAME="${GIT_USER_NAME:-claude-task-runner}"
+export GIT_COMMITTER_EMAIL="${GIT_USER_EMAIL:-claude-task-runner@automated}"
+
 # ─── Authenticate git provider CLI ─────────────────────────────────────────
 GIT_PROVIDER="${GIT_PROVIDER:-gitlab}"
 
@@ -224,7 +255,11 @@ fi
 if [ "${SKIP_CLONE:-0}" = "1" ]; then
     chown -R claude-runner:claude-runner /workspace/signals 2>/dev/null || true
 else
+    echo "[entrypoint] Setting file ownership on /workspace..."
+    start_timer "Setting file ownership"
     chown -R claude-runner:claude-runner /workspace 2>/dev/null || true
+    stop_timer
+    echo "[entrypoint] File ownership set."
 fi
 
 # ─── Drop to non-root and execute command ────────────────────────────────────
@@ -254,4 +289,5 @@ echo 'exec "$@"' >> "$WRAPPER"
 chmod +x "$WRAPPER"
 chown claude-runner:claude-runner "$WRAPPER"
 
+echo "[entrypoint] Starting Claude Code..."
 exec su - claude-runner -s /bin/bash -- "$WRAPPER" "$@"
