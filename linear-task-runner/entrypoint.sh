@@ -116,8 +116,8 @@ if ! command -v claude &>/dev/null; then
 fi
 
 # ─── Setup git config ───────────────────────────────────────────────────────
-git config --global user.name "claude-task-runner"
-git config --global user.email "claude-task-runner@automated"
+git config --global user.name "${GIT_USER_NAME:-claude-task-runner}"
+git config --global user.email "${GIT_USER_EMAIL:-claude-task-runner@automated}"
 git config --global init.defaultBranch main
 
 # ─── Authenticate git provider CLI ─────────────────────────────────────────

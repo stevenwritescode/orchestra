@@ -244,8 +244,11 @@ function rescueUnpushedWork(stagingPath) {
       execSync(`git -C "${repoPath}" add -A`, { stdio: "pipe" });
       execSync(`git -C "${repoPath}" commit -m "WIP: rescued uncommitted work"`, {
         stdio: "pipe",
-        env: { ...process.env, GIT_AUTHOR_NAME: "claude-manual-runner", GIT_AUTHOR_EMAIL: "claude@automated",
-               GIT_COMMITTER_NAME: "claude-manual-runner", GIT_COMMITTER_EMAIL: "claude@automated" },
+        env: { ...process.env,
+          GIT_AUTHOR_NAME: process.env.GIT_USER_NAME || "claude-task-runner",
+          GIT_AUTHOR_EMAIL: process.env.GIT_USER_EMAIL || "claude-task-runner@automated",
+          GIT_COMMITTER_NAME: process.env.GIT_USER_NAME || "claude-task-runner",
+          GIT_COMMITTER_EMAIL: process.env.GIT_USER_EMAIL || "claude-task-runner@automated" },
       });
     }
 
@@ -309,6 +312,8 @@ ${branchInstruction}
       "--cap-add=NET_ADMIN",
       "-e", `ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}`,
       "-e", `GIT_PROVIDER=${GIT_PROVIDER}`,
+      ...(process.env.GIT_USER_NAME ? ["-e", `GIT_USER_NAME=${process.env.GIT_USER_NAME}`] : []),
+      ...(process.env.GIT_USER_EMAIL ? ["-e", `GIT_USER_EMAIL=${process.env.GIT_USER_EMAIL}`] : []),
       "--memory=4g", "--cpus=2",
     ];
 

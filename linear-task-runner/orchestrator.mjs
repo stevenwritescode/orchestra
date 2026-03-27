@@ -891,6 +891,8 @@ Example: ${cliExample}`;
       // work as API keys (sk-ant-oat01-... format)
       "-e", `ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}`,
       "-e", `GIT_PROVIDER=${GIT_PROVIDER}`,
+      ...(process.env.GIT_USER_NAME ? ["-e", `GIT_USER_NAME=${process.env.GIT_USER_NAME}`] : []),
+      ...(process.env.GIT_USER_EMAIL ? ["-e", `GIT_USER_EMAIL=${process.env.GIT_USER_EMAIL}`] : []),
       ...(process.env.CUSTOM_CA_CERT ? ["-e", `CUSTOM_CA_CERT=${process.env.CUSTOM_CA_CERT}`] : []),
       "--memory=4g",
       "--cpus=2",
@@ -1222,8 +1224,11 @@ function rescueUnpushedWork(stagingPath, taskIdentifier) {
       execSync(`git -C "${repoPath}" add -A`, { stdio: "pipe" });
       execSync(`git -C "${repoPath}" commit -m "${taskIdentifier}: WIP — rescued uncommitted work"`, {
         stdio: "pipe",
-        env: { ...process.env, GIT_AUTHOR_NAME: "claude-task-runner", GIT_AUTHOR_EMAIL: "claude-task-runner@automated",
-               GIT_COMMITTER_NAME: "claude-task-runner", GIT_COMMITTER_EMAIL: "claude-task-runner@automated" },
+        env: { ...process.env,
+          GIT_AUTHOR_NAME: process.env.GIT_USER_NAME || "claude-task-runner",
+          GIT_AUTHOR_EMAIL: process.env.GIT_USER_EMAIL || "claude-task-runner@automated",
+          GIT_COMMITTER_NAME: process.env.GIT_USER_NAME || "claude-task-runner",
+          GIT_COMMITTER_EMAIL: process.env.GIT_USER_EMAIL || "claude-task-runner@automated" },
       });
     }
 
