@@ -17,49 +17,19 @@
 
 import { execSync, spawn } from "child_process";
 import { randomUUID } from "crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath, pathToFileURL } from "url";
 import { createInterface } from "readline";
+import { loadEnv } from "../linear-task-runner/lib/env.mjs";
+import { getClaudeOAuthToken } from "../linear-task-runner/lib/auth.mjs";
+import { buildSkillsPromptSection } from "../linear-task-runner/lib/skills.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-// ─── Auto-load .env file ───────────────────────────────────────────────────
-function loadEnvFile() {
-  const envPath = join(__dirname, ".env");
-  if (!existsSync(envPath)) return;
-  const lines = readFileSync(envPath, "utf8").split("\n");
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    const eqIdx = trimmed.indexOf("=");
-    if (eqIdx === -1) continue;
-    const key = trimmed.slice(0, eqIdx).trim();
-    const val = trimmed.slice(eqIdx + 1).trim().replace(/^["']|["']$/g, "");
-    if (!(key in process.env) || process.env[key] === undefined) {
-      process.env[key] = val;
-    }
-  }
-}
-loadEnvFile();
-
-// Also load from the linear-task-runner .env as fallback for shared config
-const ltEnv = join(__dirname, "..", "linear-task-runner", ".env");
-if (existsSync(ltEnv)) {
-  const lines = readFileSync(ltEnv, "utf8").split("\n");
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    const eqIdx = trimmed.indexOf("=");
-    if (eqIdx === -1) continue;
-    const key = trimmed.slice(0, eqIdx).trim();
-    const val = trimmed.slice(eqIdx + 1).trim().replace(/^["']|["']$/g, "");
-    if (!(key in process.env) || process.env[key] === undefined) {
-      process.env[key] = val;
-    }
-  }
-}
+// Load local .env first, then fall back to linear-task-runner/.env for shared config
+loadEnv(__dirname, join(__dirname, "..", "linear-task-runner", ".env"));
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 const GIT_PROVIDER = process.env.GIT_PROVIDER || "gitlab";
@@ -85,63 +55,6 @@ function log(msg) {
   console.log(`[${ts()}] ${msg}`);
 }
 
-// ─── Claude auth ────────────────────────────────────────────────────────────
-function getClaudeOAuthToken() {
-  // macOS: read from Keychain
-  if (process.platform === "darwin") {
-    try {
-      const raw = execSync(
-        'security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null',
-        { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }
-      ).trim();
-      const token = JSON.parse(raw)?.claudeAiOauth?.accessToken;
-      if (token) {
-        log("Auth: using Claude OAuth token from macOS Keychain");
-        return token;
-      }
-    } catch {}
-  }
-
-  // Windows: try Credential Manager via PowerShell
-  // Requires the CredentialManager module: Install-Module CredentialManager
-  if (process.platform === "win32") {
-    try {
-      const raw = execSync(
-        `powershell -NoProfile -Command "` +
-        `(Get-StoredCredential -Target 'Claude Code-credentials').Password | ` +
-        `ConvertFrom-SecureString -AsPlainText"`,
-        { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }
-      ).trim();
-      const token = JSON.parse(raw)?.claudeAiOauth?.accessToken;
-      if (token) {
-        log("Auth: using Claude OAuth token from Windows Credential Manager");
-        return token;
-      }
-    } catch {}
-  }
-
-  // All platforms: fall back to credentials file in common locations
-  const home = process.env.HOME || process.env.USERPROFILE || "";
-  const credPaths = [
-    process.env.CLAUDE_CONFIG_DIR && join(process.env.CLAUDE_CONFIG_DIR, ".credentials.json"),
-    home && join(home, ".claude", ".credentials.json"),
-    process.env.APPDATA && join(process.env.APPDATA, "Claude Code", ".credentials.json"),
-    process.env.LOCALAPPDATA && join(process.env.LOCALAPPDATA, "Claude Code", ".credentials.json"),
-  ].filter(Boolean);
-
-  for (const p of credPaths) {
-    if (existsSync(p)) {
-      try {
-        const token = JSON.parse(readFileSync(p, "utf8"))?.claudeAiOauth?.accessToken;
-        if (token) {
-          log(`Auth: using Claude OAuth token from ${p}`);
-          return token;
-        }
-      } catch {}
-    }
-  }
-  return null;
-}
 
 let ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "";
 if (!ANTHROPIC_API_KEY) {
@@ -303,65 +216,6 @@ function rescueUnpushedWork(stagingPath) {
   }
 }
 
-// ─── Skills loader ───────────────────────────────────────────────────────────
-function loadSkills() {
-  if (!CLAUDE_SKILLS_DIR || !existsSync(CLAUDE_SKILLS_DIR)) return [];
-  try {
-    return readdirSync(CLAUDE_SKILLS_DIR)
-      .filter((f) => f.endsWith(".md"))
-      .map((f) => {
-        const content = readFileSync(join(CLAUDE_SKILLS_DIR, f), "utf8");
-        const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
-        const fm = fmMatch ? fmMatch[1] : "";
-        const nameMatch = fm.match(/^name:\s*(.+)$/m);
-        const descMatch = fm.match(/^description:\s*(.+)$/m);
-        const name = nameMatch ? nameMatch[1].trim() : f.replace(/\.md$/, "");
-        const description = descMatch ? descMatch[1].trim() : "";
-        return { name, description, file: f };
-      })
-      .filter((s) => s.name);
-  } catch (err) {
-    log(`Skills: failed to load — ${err.message}`);
-    return [];
-  }
-}
-
-function buildSkillsPromptSection(instructions) {
-  const skills = loadSkills();
-  if (skills.length === 0) return "";
-
-  // Score relevance against the instructions text
-  const needles = instructions.toLowerCase().split(/\W+/).filter((w) => w.length > 2);
-  const scored = skills
-    .map((s) => {
-      const haystack = [s.name, s.description, s.file].join(" ").toLowerCase();
-      const score = needles.filter((w) => haystack.includes(w)).length;
-      return { ...s, score };
-    })
-    .sort((a, b) => b.score - a.score);
-
-  const relevant = scored.filter((s) => s.score > 0);
-  const other = scored.filter((s) => s.score === 0);
-  const fmt = (s) => `  /${s.name}${s.description ? ` — ${s.description}` : ""}`;
-
-  const lines = [
-    "════════════════════════════════════════════════════════════",
-    "AVAILABLE SKILLS",
-    "The following Claude Code skills are installed. Invoke relevant ones",
-    "early in your session using /<skill-name>.",
-    "════════════════════════════════════════════════════════════",
-  ];
-  if (relevant.length > 0) {
-    lines.push("", "LIKELY RELEVANT TO THIS TASK:");
-    relevant.forEach((s) => lines.push(fmt(s)));
-  }
-  if (other.length > 0) {
-    lines.push("", "OTHER AVAILABLE SKILLS:");
-    other.forEach((s) => lines.push(fmt(s)));
-  }
-  lines.push("════════════════════════════════════════════════════════════");
-  return "\n" + lines.join("\n");
-}
 
 // ─── Run container ──────────────────────────────────────────────────────────
 function runContainer(opts) {
@@ -378,7 +232,7 @@ function runContainer(opts) {
     const prompt = `You are an autonomous developer working on a task.
 
 ${instructions}
-${buildSkillsPromptSection(instructions)}
+${buildSkillsPromptSection(CLAUDE_SKILLS_DIR, instructions, log)}
 ════════════════════════════════════════════════════════════
 CONTEXT & SUB-AGENTS
 ════════════════════════════════════════════════════════════
@@ -387,6 +241,11 @@ You are running in a container with a finite context window. Manage it carefully
 - Summarise tool output mentally — do not re-read results you already processed.
 - Delegate independent subtasks to sub-agents using the Task tool. Sub-agents get a
   fresh context window. Always tell them the working branch is "${branch}".
+
+INBOX (human instructions sent mid-task):
+- Before each major step, check /workspace/signals/inbox.txt for new instructions:
+    [ -s /workspace/signals/inbox.txt ] && cat /workspace/signals/inbox.txt && truncate -s 0 /workspace/signals/inbox.txt
+- If the file has content, read it, acknowledge it, and incorporate it before continuing.
 ════════════════════════════════════════════════════════════
 
 Instructions:

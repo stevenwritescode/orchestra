@@ -19,28 +19,14 @@ import { randomUUID } from "crypto";
 import { existsSync, mkdirSync, cpSync, readFileSync, writeFileSync, readdirSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath, pathToFileURL } from "url";
+import { loadEnv } from "./lib/env.mjs";
+import { getClaudeOAuthToken } from "./lib/auth.mjs";
+import { buildSkillsPromptSection } from "./lib/skills.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-// ─── Auto-load .env file ───────────────────────────────────────────────────
-function loadEnvFile() {
-  const envPath = join(__dirname, ".env");
-  if (!existsSync(envPath)) return;
-  const lines = readFileSync(envPath, "utf8").split("\n");
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    const eqIdx = trimmed.indexOf("=");
-    if (eqIdx === -1) continue;
-    const key = trimmed.slice(0, eqIdx).trim();
-    const val = trimmed.slice(eqIdx + 1).trim().replace(/^["']|["']$/g, "");
-    if (!(key in process.env) || process.env[key] === undefined) {
-      process.env[key] = val;
-    }
-  }
-}
-loadEnvFile();
+loadEnv(__dirname);
 
 // OAuth support: import the token manager for auto-refreshing Linear tokens.
 // Resolve relative to THIS file's directory, not CWD.
@@ -51,71 +37,6 @@ try {
   ({ getLinearToken } = await import(oauthUrl));
 } catch {
   // linear-oauth.mjs not available — that's fine if using API key
-}
-
-// ─── Claude auth: API key or OAuth from Claude Code login ───────────────────
-// If ANTHROPIC_API_KEY is not set, try to read the OAuth token from Claude
-// Code's stored credentials. Checks platform credential stores first, then
-// falls back to the credentials JSON file in common locations.
-function getClaudeOAuthToken() {
-  // macOS: read from Keychain
-  if (process.platform === "darwin") {
-    try {
-      const raw = execSync(
-        'security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null',
-        { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }
-      ).trim();
-      const token = JSON.parse(raw)?.claudeAiOauth?.accessToken;
-      if (token) {
-        log("Using Claude OAuth token from macOS Keychain");
-        return token;
-      }
-    } catch { /* not in Keychain */ }
-  }
-
-  // Windows: try Credential Manager via PowerShell
-  // Requires the CredentialManager module: Install-Module CredentialManager
-  if (process.platform === "win32") {
-    try {
-      const raw = execSync(
-        `powershell -NoProfile -Command "` +
-        `(Get-StoredCredential -Target 'Claude Code-credentials').Password | ` +
-        `ConvertFrom-SecureString -AsPlainText"`,
-        { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }
-      ).trim();
-      const token = JSON.parse(raw)?.claudeAiOauth?.accessToken;
-      if (token) {
-        log("Using Claude OAuth token from Windows Credential Manager");
-        return token;
-      }
-    } catch { /* module not installed or credential not found */ }
-  }
-
-  // All platforms: fall back to credentials file in common locations
-  const home = process.env.HOME || process.env.USERPROFILE || "";
-  const credPaths = [
-    // Explicit override
-    process.env.CLAUDE_CONFIG_DIR && join(process.env.CLAUDE_CONFIG_DIR, ".credentials.json"),
-    // Standard location (macOS/Linux)
-    home && join(home, ".claude", ".credentials.json"),
-    // Windows: Electron app data
-    process.env.APPDATA && join(process.env.APPDATA, "Claude Code", ".credentials.json"),
-    process.env.LOCALAPPDATA && join(process.env.LOCALAPPDATA, "Claude Code", ".credentials.json"),
-  ].filter(Boolean);
-
-  for (const credPath of credPaths) {
-    if (existsSync(credPath)) {
-      try {
-        const token = JSON.parse(readFileSync(credPath, "utf8"))?.claudeAiOauth?.accessToken;
-        if (token) {
-          log(`Using Claude OAuth token from ${credPath}`);
-          return token;
-        }
-      } catch { /* invalid JSON or missing field */ }
-    }
-  }
-
-  return null;
 }
 
 // ─── Configuration ──────────────────────────────────────────────────────────
@@ -203,9 +124,9 @@ function saveTaskState(state) {
   writeFileSync(TASK_STATE_FILE, JSON.stringify(state, null, 2));
 }
 
-function markTaskActive(identifier) {
+function markTaskActive(identifier, containerName) {
   const state = loadTaskState();
-  state[identifier] = { status: "active", startedAt: new Date().toISOString() };
+  state[identifier] = { status: "active", startedAt: new Date().toISOString(), containerName };
   saveTaskState(state);
 }
 
@@ -414,85 +335,6 @@ async function addIssueComment(issueId, body) {
       }
     }
   `, { issueId, body });
-}
-
-// ─── Skills loader ───────────────────────────────────────────────────────────
-// Reads all .md files from CLAUDE_SKILLS_DIR and parses their frontmatter.
-// Returns an array of { name, description, file } objects.
-function loadSkills() {
-  if (!CLAUDE_SKILLS_DIR || !existsSync(CLAUDE_SKILLS_DIR)) return [];
-  try {
-    return readdirSync(CLAUDE_SKILLS_DIR)
-      .filter((f) => f.endsWith(".md"))
-      .map((f) => {
-        const content = readFileSync(join(CLAUDE_SKILLS_DIR, f), "utf8");
-        const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
-        const fm = fmMatch ? fmMatch[1] : "";
-        const nameMatch = fm.match(/^name:\s*(.+)$/m);
-        const descMatch = fm.match(/^description:\s*(.+)$/m);
-        const name = nameMatch ? nameMatch[1].trim() : f.replace(/\.md$/, "");
-        const description = descMatch ? descMatch[1].trim() : "";
-        return { name, description, file: f };
-      })
-      .filter((s) => s.name);
-  } catch (err) {
-    log(`[skills] Failed to load skills: ${err.message}`);
-    return [];
-  }
-}
-
-// Score a skill's relevance to a task. Returns a positive number if relevant.
-// Matches against task labels, project name, and title keywords.
-function scoreSkillRelevance(skill, task) {
-  const haystack = [
-    skill.name,
-    skill.description,
-    skill.file,
-  ].join(" ").toLowerCase();
-
-  const needles = [
-    ...(task.labels?.nodes?.map((l) => l.name) || []),
-    task.project?.name || "",
-    task.title || "",
-  ].join(" ").toLowerCase().split(/\W+/).filter((w) => w.length > 2);
-
-  return needles.filter((w) => haystack.includes(w)).length;
-}
-
-// Build the skills prompt section for a task.
-function buildSkillsPromptSection(task) {
-  const skills = loadSkills();
-  if (skills.length === 0) return "";
-
-  const scored = skills
-    .map((s) => ({ ...s, score: scoreSkillRelevance(s, task) }))
-    .sort((a, b) => b.score - a.score);
-
-  const relevant = scored.filter((s) => s.score > 0);
-  const other = scored.filter((s) => s.score === 0);
-
-  const fmt = (s) => `  /${s.name}${s.description ? ` — ${s.description}` : ""}`;
-
-  const lines = [
-    "════════════════════════════════════════════════════════════",
-    "AVAILABLE SKILLS",
-    "The following Claude Code skills are installed. Invoke relevant ones",
-    "early in your session using /<skill-name>.",
-    "════════════════════════════════════════════════════════════",
-  ];
-
-  if (relevant.length > 0) {
-    lines.push("", "LIKELY RELEVANT TO THIS TASK:");
-    relevant.forEach((s) => lines.push(fmt(s)));
-  }
-
-  if (other.length > 0) {
-    lines.push("", "OTHER AVAILABLE SKILLS:");
-    other.forEach((s) => lines.push(fmt(s)));
-  }
-
-  lines.push("════════════════════════════════════════════════════════════");
-  return "\n" + lines.join("\n");
 }
 
 // ─── Git Provider API helper ────────────────────────────────────────────────
@@ -925,6 +767,8 @@ async function runInContainer(task, extraPrompt = "") {
   const containerName = `task-${task.identifier}-${randomUUID().slice(0, 8)}`;
   const branchName = `task/${task.identifier.toLowerCase()}`;
   let stagingPath = null;
+  // Record container name in task state so send.mjs can reach it
+  markTaskActive(task.identifier, containerName);
 
   // Prepare staging copy early so we can download images into it
   if (LOCAL_REPO_PATH) {
@@ -1012,7 +856,11 @@ END OF TEAM COMMENTS
 ${extraPrompt ? `\nAdditional context:\n${extraPrompt}` : ""}
 ${scopeInstructions}
 ${imagePromptSection}
-${buildSkillsPromptSection(task)}
+${buildSkillsPromptSection(CLAUDE_SKILLS_DIR, [
+    ...(task.labels?.nodes?.map((l) => l.name) || []),
+    task.project?.name || "",
+    task.title || "",
+  ].join(" "), log)}
 ════════════════════════════════════════════════════════════
 CONTEXT & SUB-AGENTS
 ════════════════════════════════════════════════════════════
@@ -1025,6 +873,12 @@ You are running in a long-lived container with a finite context window. Manage i
   should commit and push their changes when done.
 - Use sub-agents for expensive exploration too: "search the codebase for X and return
   the relevant file paths and line numbers" is a good sub-agent task.
+
+INBOX (human instructions sent mid-task):
+- Before each major step, check /workspace/signals/inbox.txt for new instructions:
+    [ -s /workspace/signals/inbox.txt ] && cat /workspace/signals/inbox.txt && truncate -s 0 /workspace/signals/inbox.txt
+- If the file has content, read it, acknowledge it in your next response, and incorporate
+  the instructions into your current work before continuing.
 ════════════════════════════════════════════════════════════
 
 Instructions:
