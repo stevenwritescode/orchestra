@@ -251,7 +251,8 @@ INBOX (human instructions sent mid-task):
 - If the file has content, read it, acknowledge it, and incorporate it before continuing.
 
 SPEC FILE & CONTEXT COMPACTION:
-At the very start, BEFORE any other work, create /workspace/signals/spec.md:
+Your session has a limit of ${MAX_TURNS} turns. At the very start, BEFORE any other work,
+create /workspace/signals/spec.md:
 
   # Task: ${branch}
   ## Objective
@@ -264,12 +265,16 @@ At the very start, BEFORE any other work, create /workspace/signals/spec.md:
 
 After completing each step: check it off ([ ] → [x]) and add a brief Progress Notes entry.
 
-If your context window is getting full (many tool calls, long outputs, or you estimate
-fewer than 20 turns remaining):
-1. Check off completed steps and note the next step in spec.md
-2. Commit and push any uncommitted changes
-3. Write the checkpoint signal: printf 'checkpoint' > /workspace/signals/checkpoint
-4. Exit immediately — a fresh session will read your spec and continue.
+The runner monitors your turn count and context window. When you approach either limit,
+it will send a CONTEXT WARNING to your inbox. When you receive one:
+1. Finish the step you are currently on
+2. Check it off in spec.md and note what comes next
+3. Commit and push any uncommitted changes
+4. Checkpoint: printf 'checkpoint' > /workspace/signals/checkpoint
+5. Exit immediately — a fresh session will read your spec and resume
+
+You can also checkpoint proactively any time you estimate fewer than
+${Math.ceil(MAX_TURNS * 0.2)} turns remain and you still have steps left.
 ${resumeNote ? `\n${resumeNote}` : ""}════════════════════════════════════════════════════════════
 
 Instructions:
@@ -373,7 +378,21 @@ ${branchInstruction}
 
     let stdout = "";
     let stderr = "";
+    let turnCount = 0;
+    let contextWarned = false;
+    const CONTEXT_WARN_TOKENS = Math.floor(200000 * 0.8);
+    const TURN_WARN_THRESHOLD = Math.floor(MAX_TURNS * 0.8);
     const spawnStart = Date.now();
+
+    const sendContextWarning = (reason) => {
+      if (contextWarned) return;
+      contextWarned = true;
+      const msg = `CONTEXT WARNING: ${reason}. Finish your current step, update /workspace/signals/spec.md, commit and push, then checkpoint: printf 'checkpoint' > /workspace/signals/checkpoint`;
+      try {
+        writeFileSync(join(signalsDir, "inbox.txt"), msg + "\n", { flag: "a" });
+        log(`Context warning → agent inbox (${reason})`);
+      } catch {}
+    };
 
     const proc = spawn("docker", dockerArgs, { timeout: TASK_TIMEOUT_MS });
 
@@ -385,6 +404,17 @@ ${branchInstruction}
         try {
           const event = JSON.parse(line);
           if (event.type === "assistant" && event.message?.content) {
+            turnCount++;
+            const inputTokens = event.message?.usage?.input_tokens ?? 0;
+
+            if (!contextWarned) {
+              if (inputTokens > CONTEXT_WARN_TOKENS) {
+                sendContextWarning(`context window ~${Math.round(inputTokens / 1000)}k / 200k tokens used`);
+              } else if (turnCount >= TURN_WARN_THRESHOLD) {
+                sendContextWarning(`turn ${turnCount}/${MAX_TURNS} reached (~80% of budget)`);
+              }
+            }
+
             for (const block of event.message.content) {
               if (block.type === "text") {
                 log(`Claude: ${block.text.slice(0, 200)}`);
