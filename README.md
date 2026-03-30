@@ -26,7 +26,7 @@ Three components that can run together or separately:
                     │                                                  │
                     ├──────────────────────────────────────────────────┤
                     │                                                  │
-  You ───────────► │  manual-runner/                                  │
+  You ────────────► │  manual-runner/                                  │
   (CLI flags or     │    1. Specify branch + instructions              │
    interactive)     │    2. Spawn sandboxed Docker container      ─────┼──► GitLab MRs
                     │    3. Agent implements + opens MR                │    or GitHub PRs
@@ -47,20 +47,7 @@ A webhook listener catches review comments (from humans or [CodeRabbit](https://
 
 See [`bug-fixer/README.md`](bug-fixer/README.md) for full setup.
 
-### Pipeline 2: Linear → Implement → MR/PR ([`linear-task-runner/`](linear-task-runner/))
-
-An orchestrator polls Linear for issues with a specific label (default: `autofix`). For each task:
-
-1. Spawns a fresh Docker container with the agent CLI and `--dangerously-skip-permissions`
-2. The agent reads the codebase, implements the task, runs tests, opens a draft MR/PR
-3. The orchestrator updates the Linear issue (Todo → In Progress → In Review) with the MR/PR link
-4. Container is destroyed — no state leakage between tasks
-
-Docker sandboxing makes `--dangerously-skip-permissions` safe: filesystem isolation, iptables firewall (whitelist only), non-root user, resource limits, no host Docker socket access.
-
-See [`linear-task-runner/README.md`](linear-task-runner/README.md) for full setup and mid-task messaging.
-
-### Pipeline 3: Manual → Implement → MR/PR ([`manual-runner/`](manual-runner/))
+### Pipeline 2: Manual → Implement → MR/PR ([`manual-runner/`](manual-runner/))
 
 Spin up a sandboxed agent container on demand with your own instructions. Same Docker isolation as the linear-task-runner, but you drive it manually via CLI flags or interactive prompts.
 
@@ -76,6 +63,19 @@ node manual-runner/run.mjs
 ```
 
 See [`manual-runner/README.md`](manual-runner/README.md) for full usage.
+
+### Pipeline 3: Linear → Implement → MR/PR ([`linear-task-runner/`](linear-task-runner/))
+
+An orchestrator polls Linear for issues with a specific label (default: `autofix`). For each task:
+
+1. Spawns a fresh Docker container with the agent CLI and `--dangerously-skip-permissions`
+2. The agent reads the codebase, implements the task, runs tests, opens a draft MR/PR
+3. The orchestrator updates the Linear issue (Todo → In Progress → In Review) with the MR/PR link
+4. Container is destroyed — no state leakage between tasks
+
+Docker sandboxing makes `--dangerously-skip-permissions` safe: filesystem isolation, iptables firewall (whitelist only), non-root user, resource limits, no host Docker socket access.
+
+See [`linear-task-runner/README.md`](linear-task-runner/README.md) for full setup and mid-task messaging.
 
 ## Agent providers
 
