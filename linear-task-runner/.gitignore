@@ -1,0 +1,4 @@
+.env
+.linear-tokens.json
+.task-state.json
+node_modules/

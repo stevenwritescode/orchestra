@@ -1,0 +1,319 @@
+#!/bin/bash
+# =============================================================================
+# Entrypoint: sets up network firewall, then drops privileges and runs Claude
+#
+# Firewall strategy:
+#   - Allow DNS (needed for all outbound)
+#   - Allow HTTPS to: Anthropic API, GitLab, npm registry
+#   - If BACKEND_PORT is set: allow traffic to Docker host gateway on that port
+#   - Block everything else
+#
+# This prevents Claude Code from exfiltrating data to arbitrary hosts
+# even with --dangerously-skip-permissions enabled.
+# =============================================================================
+
+set -e
+
+# ─── Progress timer helper ────────────────────────────────────────────────────
+# Usage: start_timer "label"  → prints "label... Xs elapsed" every 5s
+#        stop_timer           → kills the background timer
+_TIMER_PID=""
+start_timer() {
+    local label="$1"
+    (
+        local elapsed=0
+        while true; do
+            sleep 5
+            elapsed=$((elapsed + 5))
+            echo "[entrypoint] ${label}... ${elapsed}s elapsed"
+        done
+    ) &
+    _TIMER_PID=$!
+}
+stop_timer() {
+    if [ -n "$_TIMER_PID" ]; then
+        kill "$_TIMER_PID" 2>/dev/null || true
+        wait "$_TIMER_PID" 2>/dev/null || true
+        _TIMER_PID=""
+    fi
+}
+
+# ─── Resolve Docker host gateway IP ─────────────────────────────────────────
+# The agent needs to reach the backend container running on the host.
+# Docker provides host.docker.internal on Docker Desktop, but on Linux
+# we need to find the gateway IP from the container's routing table.
+get_host_gateway_ip() {
+    # Try host.docker.internal first (Docker Desktop for Mac/Windows)
+    local ip
+    ip=$(getent hosts host.docker.internal 2>/dev/null | awk '{print $1}')
+    if [ -n "$ip" ]; then
+        echo "$ip"
+        return
+    fi
+    # Fall back to default gateway (Linux Docker)
+    ip route | awk '/default/ { print $3 }' | head -1
+}
+
+# ─── Setup firewall (requires NET_ADMIN capability) ─────────────────────────
+setup_firewall() {
+    echo "[entrypoint] Setting up firewall rules..."
+
+    # Flush existing rules
+    iptables -F OUTPUT 2>/dev/null || true
+
+    # Allow loopback
+    iptables -A OUTPUT -o lo -j ACCEPT
+
+    # Allow DNS (UDP 53) — needed for hostname resolution
+    iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
+    iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT
+
+    # Allow HTTPS (443) — covers GitLab, npm registry, Anthropic API
+    # For stricter control, resolve and whitelist specific IPs or use a proxy
+    iptables -A OUTPUT -p tcp --dport 443 -j ACCEPT
+
+    # Allow SSH (22) for git operations
+    iptables -A OUTPUT -p tcp --dport 22 -j ACCEPT
+
+    # Allow HTTP (80) for package registries that redirect
+    iptables -A OUTPUT -p tcp --dport 80 -j ACCEPT
+
+    # ── Backend access: allow agent to reach the backend on the host ─────
+    # BACKEND_PORT can be a single port "3000" or comma-separated "3000,5432"
+    if [ -n "${BACKEND_PORT:-}" ]; then
+        HOST_GW=$(get_host_gateway_ip)
+        if [ -n "$HOST_GW" ]; then
+            IFS=',' read -ra PORTS <<< "$BACKEND_PORT"
+            for port in "${PORTS[@]}"; do
+                port=$(echo "$port" | tr -d ' ')
+                iptables -A OUTPUT -p tcp -d "$HOST_GW" --dport "$port" -j ACCEPT
+                echo "[entrypoint] Allowing backend access: ${HOST_GW}:${port}"
+            done
+        else
+            echo "[entrypoint] WARNING: Could not determine host gateway IP for backend access"
+        fi
+    fi
+
+    # Allow established/related connections
+    iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+    # Drop everything else
+    iptables -A OUTPUT -j DROP
+
+    echo "[entrypoint] Firewall configured."
+}
+
+# Only set up firewall if we have the capability
+if iptables -L OUTPUT -n &>/dev/null; then
+    setup_firewall
+else
+    echo "[entrypoint] No NET_ADMIN capability — skipping firewall setup."
+    echo "[entrypoint] For maximum security, run with --cap-add=NET_ADMIN"
+fi
+
+# ─── Install custom CA cert (e.g. Zscaler) ───────────────────────────────────
+# CUSTOM_CA_CERT can be an absolute path or relative to /workspace/repo.
+# Set it only on networks that do SSL inspection. Leave empty otherwise.
+if [ -n "${CUSTOM_CA_CERT:-}" ]; then
+    CERT_PATH="$CUSTOM_CA_CERT"
+    # If relative, resolve against the repo
+    if [[ "$CERT_PATH" != /* ]]; then
+        CERT_PATH="/workspace/repo/${CERT_PATH}"
+    fi
+    if [ -f "$CERT_PATH" ]; then
+        cp "$CERT_PATH" /usr/local/share/ca-certificates/custom-ca.crt
+        update-ca-certificates 2>/dev/null
+        export NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/custom-ca.crt
+        echo "[entrypoint] Custom CA cert installed from ${CERT_PATH}"
+    else
+        echo "[entrypoint] WARNING: CUSTOM_CA_CERT set but file not found: ${CERT_PATH}"
+    fi
+fi
+
+# ─── Install agent CLI ───────────────────────────────────────────────────────
+# Done at runtime (not in Dockerfile) so CUSTOM_CA_CERT is available for npm.
+# Skips if already installed.
+AGENT_PROVIDER="${AGENT_PROVIDER:-claude}"
+
+if [ "$AGENT_PROVIDER" = "codex" ]; then
+    if ! command -v codex &>/dev/null; then
+        echo "[entrypoint] Installing Codex CLI..."
+        start_timer "Installing Codex CLI"
+        npm install -g @openai/codex 2>&1 | tail -3
+        stop_timer
+        echo "[entrypoint] Codex CLI installed."
+    fi
+else
+    if ! command -v claude &>/dev/null; then
+        echo "[entrypoint] Installing Claude Code CLI..."
+        start_timer "Installing Claude Code CLI"
+        npm install -g @anthropic-ai/claude-code 2>&1 | tail -3
+        stop_timer
+        echo "[entrypoint] Claude Code CLI installed."
+    fi
+fi
+
+# ─── Setup git config ───────────────────────────────────────────────────────
+git config --global user.name "${GIT_USER_NAME:-claude-task-runner}"
+git config --global user.email "${GIT_USER_EMAIL:-claude-task-runner@automated}"
+git config --global init.defaultBranch main
+
+# Export git identity as env vars so they override any `git config user.*`
+# changes Claude may make during task execution.
+export GIT_AUTHOR_NAME="${GIT_USER_NAME:-claude-task-runner}"
+export GIT_AUTHOR_EMAIL="${GIT_USER_EMAIL:-claude-task-runner@automated}"
+export GIT_COMMITTER_NAME="${GIT_USER_NAME:-claude-task-runner}"
+export GIT_COMMITTER_EMAIL="${GIT_USER_EMAIL:-claude-task-runner@automated}"
+
+# ─── Authenticate git provider CLI ─────────────────────────────────────────
+GIT_PROVIDER="${GIT_PROVIDER:-gitlab}"
+
+if [ "$GIT_PROVIDER" = "github" ]; then
+    if [ -n "$GITHUB_TOKEN" ]; then
+        export GH_TOKEN="$GITHUB_TOKEN"
+
+        GITHUB_HOST="${GITHUB_URL:-https://github.com}"
+        GITHUB_HOST="${GITHUB_HOST#https://}"
+        GITHUB_HOST="${GITHUB_HOST#http://}"
+
+        # Configure gh CLI
+        mkdir -p /home/claude-runner/.config/gh
+        cat > /home/claude-runner/.config/gh/hosts.yml <<GHEOF
+${GITHUB_HOST}:
+    oauth_token: ${GITHUB_TOKEN}
+    git_protocol: https
+GHEOF
+        chown -R claude-runner:claude-runner /home/claude-runner/.config
+
+        echo "[entrypoint] gh CLI configured for ${GITHUB_HOST}."
+    fi
+else
+    if [ -n "$GITLAB_TOKEN" ]; then
+        # glab uses GITLAB_TOKEN env var directly for authentication.
+        # Set the default host for glab CLI.
+        GITLAB_HOST="${GITLAB_URL:-https://gitlab.com}"
+        GITLAB_HOST="${GITLAB_HOST#https://}"
+        GITLAB_HOST="${GITLAB_HOST#http://}"
+
+        # Configure glab to use the token
+        mkdir -p /home/claude-runner/.config/glab-cli
+        cat > /home/claude-runner/.config/glab-cli/config.yml <<GLABEOF
+hosts:
+  ${GITLAB_HOST}:
+    token: ${GITLAB_TOKEN}
+    api_protocol: https
+    git_protocol: https
+GLABEOF
+        chown -R claude-runner:claude-runner /home/claude-runner/.config
+
+        echo "[entrypoint] glab CLI configured for ${GITLAB_HOST}."
+
+        # Verify glab can actually authenticate (catches bad tokens early)
+        if glab auth status 2>&1 | grep -q "Logged in"; then
+            echo "[entrypoint] glab auth verified."
+        else
+            echo "[entrypoint] WARNING: glab auth check failed — API calls from Claude may get 403s."
+        fi
+    fi
+fi
+
+# ─── Clone repo if not already present ───────────────────────────────────────
+# Build authenticated URL based on git provider
+get_authed_url() {
+    local url="$1"
+    if [ "$GIT_PROVIDER" = "github" ] && [ -n "$GITHUB_TOKEN" ]; then
+        echo "$url" | sed "s|https://|https://${GITHUB_TOKEN}@|"
+    elif [ "$GIT_PROVIDER" = "gitlab" ] && [ -n "$GITLAB_TOKEN" ]; then
+        echo "$url" | sed "s|https://|https://oauth2:${GITLAB_TOKEN}@|"
+    else
+        echo "$url"
+    fi
+}
+
+if [ "${SKIP_CLONE:-0}" = "1" ] && [ -d "/workspace/repo/.git" ]; then
+    echo "[entrypoint] Using bind-mounted repo (SKIP_CLONE=1)."
+
+    # Configure the remote to use authenticated URL for push.
+    # Fall back to reading the existing remote URL if REPO_URL wasn't passed.
+    EFFECTIVE_REPO_URL="${REPO_URL:-$(git -C /workspace/repo remote get-url origin 2>/dev/null || echo '')}"
+    if [ -n "$EFFECTIVE_REPO_URL" ] && [[ "$EFFECTIVE_REPO_URL" == https://* ]]; then
+        AUTHED_URL=$(get_authed_url "$EFFECTIVE_REPO_URL")
+        if [ "$AUTHED_URL" != "$EFFECTIVE_REPO_URL" ]; then
+            git -C /workspace/repo remote set-url origin "$AUTHED_URL" 2>/dev/null || true
+            echo "[entrypoint] Push auth configured for ${GIT_PROVIDER}."
+        else
+            echo "[entrypoint] WARNING: Push auth not configured — token missing or GIT_PROVIDER mismatch (provider=${GIT_PROVIDER:-unset})."
+        fi
+    fi
+elif [ -n "$REPO_URL" ] && [ ! -d "/workspace/repo/.git" ]; then
+    # Inject token into clone URL for HTTPS auth
+    if [[ "$REPO_URL" == https://* ]]; then
+        AUTHED_URL=$(get_authed_url "$REPO_URL")
+        git clone "$AUTHED_URL" /workspace/repo
+    else
+        git clone "$REPO_URL" /workspace/repo
+    fi
+    echo "[entrypoint] Repository cloned."
+fi
+
+# ─── Setup signals directory for orchestrator communication ──────────────────
+mkdir -p /workspace/signals
+echo "[entrypoint] Signals directory ready at /workspace/signals"
+
+# ─── Write backend URL hint for the agent ────────────────────────────────────
+if [ -n "${BACKEND_PORT:-}" ]; then
+    HOST_GW=$(get_host_gateway_ip)
+    # Extract first port for the primary URL
+    PRIMARY_PORT=$(echo "$BACKEND_PORT" | cut -d',' -f1 | tr -d ' ')
+    echo "http://${HOST_GW}:${PRIMARY_PORT}" > /workspace/signals/backend-url
+    echo "[entrypoint] Backend URL: http://${HOST_GW}:${PRIMARY_PORT}"
+fi
+
+# ─── Set ownership for non-root user ────────────────────────────────────────
+# When SKIP_CLONE=1 the repo is bind-mounted from the host — chowning it
+# is unnecessary and extremely slow on macOS Docker bind mounts.
+# Only chown workspace artifacts created inside the container.
+if [ "${SKIP_CLONE:-0}" = "1" ]; then
+    chown -R claude-runner:claude-runner /workspace/signals 2>/dev/null || true
+else
+    echo "[entrypoint] Setting file ownership on /workspace..."
+    start_timer "Setting file ownership"
+    chown -R claude-runner:claude-runner /workspace 2>/dev/null || true
+    stop_timer
+    echo "[entrypoint] File ownership set."
+fi
+
+# ─── Drop to non-root and execute command ────────────────────────────────────
+# Write a wrapper script so the multi-line prompt doesn't get mangled by su -c.
+WRAPPER=/tmp/run-as-claude.sh
+if [ "$AGENT_PROVIDER" = "codex" ]; then
+    AGENT_BIN=$(which codex 2>/dev/null || echo "")
+else
+    AGENT_BIN=$(which claude 2>/dev/null || echo "")
+fi
+AGENT_BIN_DIR=$(dirname "$AGENT_BIN" 2>/dev/null || echo "")
+CLAUDE_BIN_DIR="$AGENT_BIN_DIR"  # keep compat with existing WRAPPER_HEAD
+cat > "$WRAPPER" <<WRAPPER_HEAD
+#!/bin/bash
+export PATH="${CLAUDE_BIN_DIR}:${PATH}"
+cd /workspace/repo || exit 1
+WRAPPER_HEAD
+
+# Pass through all env vars the command needs
+for var in NODE_EXTRA_CA_CERTS ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY OPENAI_API_KEY GITHUB_TOKEN GH_TOKEN GITLAB_TOKEN; do
+    eval "val=\${${var}:-}"
+    if [ -n "$val" ]; then
+        echo "export ${var}='${val}'" >> "$WRAPPER"
+    fi
+done
+
+if [ "$GIT_PROVIDER" = "github" ]; then
+    echo "export GH_TOKEN='${GITHUB_TOKEN}'" >> "$WRAPPER"
+fi
+
+echo 'exec "$@"' >> "$WRAPPER"
+chmod +x "$WRAPPER"
+chown claude-runner:claude-runner "$WRAPPER"
+
+echo "[entrypoint] Starting Claude Code..."
+exec su - claude-runner -s /bin/bash -- "$WRAPPER" "$@"
