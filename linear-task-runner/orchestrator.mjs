@@ -78,6 +78,7 @@ const BACKEND_TEST_CMD = process.env.BACKEND_TEST_CMD || "docker compose run --r
 const BACKEND_HEALTH_URL = process.env.BACKEND_HEALTH_URL || "";
 const BACKEND_HEALTH_TIMEOUT_MS = parseInt(process.env.BACKEND_HEALTH_TIMEOUT_MS || "30000");
 const MAX_FIX_ITERATIONS = parseInt(process.env.MAX_FIX_ITERATIONS || "3");
+const MAX_CONTEXT_RESETS = parseInt(process.env.MAX_CONTEXT_RESETS || "5");
 
 // Live backend access: the agent can curl the backend directly.
 // The orchestrator starts the backend before the agent, and watches for
@@ -756,6 +757,16 @@ async function runInContainer(task, extraPrompt = "") {
   // Record container name in task state so send.mjs can reach it
   markTaskActive(task.identifier, containerName);
 
+  // Persistent signals dir for this task — survives context resets.
+  // Lives in .orchestra/ (gitignored) so spec + checkpoint files persist
+  // across container respawns without polluting the repo.
+  const taskSignalsDir = join(
+    __dirname, "..", ".orchestra", "tasks",
+    task.identifier.toLowerCase().replace(/[^a-z0-9-]/g, "-"), "signals"
+  );
+  mkdirSync(taskSignalsDir, { recursive: true });
+  try { execSync(`chmod -R 777 "${taskSignalsDir}"`, { stdio: "pipe" }); } catch {}
+
   // Prepare staging copy early so we can download images into it
   if (LOCAL_REPO_PATH) {
     stagingPath = prepareStagingCopy(task.identifier);
@@ -865,6 +876,30 @@ INBOX (human instructions sent mid-task):
     [ -s /workspace/signals/inbox.txt ] && cat /workspace/signals/inbox.txt && truncate -s 0 /workspace/signals/inbox.txt
 - If the file has content, read it, acknowledge it in your next response, and incorporate
   the instructions into your current work before continuing.
+
+SPEC FILE & CONTEXT COMPACTION:
+At the very start, BEFORE any other work, create /workspace/signals/spec.md:
+
+  # Task: ${task.identifier} - ${task.title}
+  ## Objective
+  <one-sentence summary of what needs to be done>
+  ## Steps
+  - [ ] Step 1: ...
+  - [ ] Step 2: ...
+  ## Progress Notes
+  <leave blank initially>
+
+After completing each step: check it off ([ ] → [x]) and add a brief Progress Notes entry.
+
+If your context window is getting full (many tool calls, long outputs, or you estimate
+fewer than 20 turns remaining before your limit):
+1. Check off completed steps and note the next step in spec.md
+2. Commit and push any uncommitted changes
+3. Write the checkpoint signal: printf 'checkpoint' > /workspace/signals/checkpoint
+4. Exit immediately
+
+The orchestrator will spawn a fresh agent session that reads your spec and resumes
+from the first unchecked step. Your git history and spec file will be intact.
 ════════════════════════════════════════════════════════════
 
 Instructions:
@@ -961,21 +996,15 @@ To list PRs: gh pr list`}`;
       dockerArgs.push("-v", `${codexAuthDir}:/home/claude-runner/.codex:rw`);
     }
 
+    // Always mount the persistent signals dir (spec file, checkpoint, inbox, rebuild signals)
+    dockerArgs.push("-v", `${taskSignalsDir}:/workspace/signals`);
+
     // Live backend access: let the agent reach the backend on the host
     if (BACKEND_LIVE_ACCESS) {
       // --add-host ensures host.docker.internal resolves on Linux too
       dockerArgs.push(
         "--add-host=host.docker.internal:host-gateway",
         "-e", `BACKEND_PORT=${BACKEND_PORT}`,
-      );
-
-      // Mount signals directory for rebuild communication
-      const signalsDir = stagingPath
-        ? join(stagingPath, "signals")
-        : join(STAGING_DIR, `signals-${containerName}`);
-      mkdirSync(signalsDir, { recursive: true });
-      dockerArgs.push(
-        "-v", `${signalsDir}:/workspace/signals`,
       );
     }
 
@@ -1061,14 +1090,11 @@ To list PRs: gh pr list`}`;
     // ── Signal watcher: rebuild backend when agent requests it ───────────
     let signalWatcherInterval = null;
     if (BACKEND_LIVE_ACCESS && BACKEND_DOCKER_COMPOSE) {
-      const signalsDir = stagingPath
-        ? join(stagingPath, "signals")
-        : join(STAGING_DIR, `signals-${containerName}`);
       const repoPath = stagingPath ? join(stagingPath, "repo") : null;
 
       signalWatcherInterval = setInterval(async () => {
-        const rebuildSignal = join(signalsDir, "rebuild");
-        const doneSignal = join(signalsDir, "rebuild-done");
+        const rebuildSignal = join(taskSignalsDir, "rebuild");
+        const doneSignal = join(taskSignalsDir, "rebuild-done");
 
         if (existsSync(rebuildSignal)) {
           log(`[${task.identifier}] Rebuild signal received from agent`);
@@ -1143,6 +1169,7 @@ To list PRs: gh pr list`}`;
         stderr,
         containerName,
         stagingPath,
+        signalsDir: taskSignalsDir,
       });
     });
 
@@ -1395,19 +1422,45 @@ async function processTask(task) {
       }
     }
 
-    // ── Phase 1: Agent makes code changes ──────────────────────────────
-    let outcome = await runInContainer(task);
-    lastStagingPath = outcome.stagingPath;
+    // ── Phase 1: Agent makes code changes (with context-reset loop) ────
+    let outcome;
+    let contextResets = 0;
 
-    if (outcome.exitCode !== 0) {
-      log(`[${task.identifier}] Failed with exit code ${outcome.exitCode}`);
-      // Rescue any work the agent did before failing
-      rescueUnpushedWork(outcome.stagingPath, task.identifier);
-      await addIssueComment(task.id,
-        `❌ Automated implementation failed (exit code ${outcome.exitCode}).\n\n**Error output:**\n\`\`\`\n${outcome.stderr.slice(-1500)}\n\`\`\`\n\nThis task needs manual attention.`
-      );
-      await updateIssueStatus(task.id, "Todo");
-      return;
+    while (true) {
+      const resumeNote = contextResets > 0
+        ? `\n\nRESUMING FROM CONTEXT RESET (session ${contextResets + 1}/${MAX_CONTEXT_RESETS + 1}):\nRead /workspace/signals/spec.md for the full spec and your progress so far.\nContinue from the first unchecked step — do NOT redo completed steps.`
+        : "";
+
+      outcome = await runInContainer(task, resumeNote);
+      lastStagingPath = outcome.stagingPath;
+
+      if (outcome.exitCode !== 0) {
+        log(`[${task.identifier}] Failed with exit code ${outcome.exitCode}`);
+        rescueUnpushedWork(outcome.stagingPath, task.identifier);
+        await addIssueComment(task.id,
+          `❌ Automated implementation failed (exit code ${outcome.exitCode}).\n\n**Error output:**\n\`\`\`\n${outcome.stderr.slice(-1500)}\n\`\`\`\n\nThis task needs manual attention.`
+        );
+        await updateIssueStatus(task.id, "Todo");
+        return;
+      }
+
+      // Check for checkpoint signal — agent ran out of context and wants a fresh session
+      const checkpointFile = join(outcome.signalsDir, "checkpoint");
+      if (existsSync(checkpointFile)) {
+        contextResets++;
+        log(`[${task.identifier}] Context checkpoint — reset ${contextResets}/${MAX_CONTEXT_RESETS}`);
+        try { execSync(`rm -f "${checkpointFile}"`, { stdio: "pipe" }); } catch {}
+        cleanupStaging(outcome.stagingPath);
+        lastStagingPath = null;
+
+        if (contextResets >= MAX_CONTEXT_RESETS) {
+          log(`[${task.identifier}] Max context resets (${MAX_CONTEXT_RESETS}) reached — proceeding`);
+          break;
+        }
+        continue;
+      }
+
+      break; // Completed normally
     }
 
     // ── Phase 2: Backend Docker testing (if configured) ────────────────

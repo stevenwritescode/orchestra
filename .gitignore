@@ -2,6 +2,7 @@
 .linear-tokens.json
 node_modules/
 .claude/
+.orchestra/
 
 # Old root-level files (GitHub version)
 /orchestrator.mjs

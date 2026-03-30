@@ -47,6 +47,7 @@ const TASK_TIMEOUT_MS = parseInt(process.env.TASK_TIMEOUT_MS || "1800000");
 const DEFAULT_BRANCH = process.env.DEFAULT_BRANCH || "main";
 const STAGING_DIR = process.env.STAGING_DIR || "/tmp/task-staging";
 const CLAUDE_SKILLS_DIR = process.env.CLAUDE_SKILLS_DIR || "";
+const MAX_CONTEXT_RESETS = parseInt(process.env.MAX_CONTEXT_RESETS || "5");
 
 function ts() {
   return new Date().toISOString().slice(0, 19);
@@ -214,10 +215,18 @@ function rescueUnpushedWork(stagingPath) {
 // ─── Run container ──────────────────────────────────────────────────────────
 function runContainer(opts) {
   return new Promise((resolve, reject) => {
-    const { branch, newBranch, instructions, model, stagingPath } = opts;
+    const { branch, newBranch, instructions, model, stagingPath, runLabel, resumeNote } = opts;
     const containerName = `manual-${branch.replace(/\//g, "-")}-${randomUUID().slice(0, 8)}`;
     const cliName = GIT_PROVIDER === "github" ? "gh" : "glab";
     const mrTerm = GIT_PROVIDER === "github" ? "pull request" : "merge request";
+
+    // Persistent signals dir for this run — survives context resets
+    const signalsDir = join(
+      __dirname, "..", ".orchestra", "runs",
+      (runLabel || branch).replace(/[^a-z0-9-]/gi, "-").toLowerCase(), "signals"
+    );
+    mkdirSync(signalsDir, { recursive: true });
+    try { execSync(`chmod -R 777 "${signalsDir}"`, { stdio: "pipe" }); } catch {}
 
     const branchInstruction = newBranch
       ? `1. Create and switch to a NEW branch: git checkout -b ${branch}`
@@ -240,7 +249,28 @@ INBOX (human instructions sent mid-task):
 - Before each major step, check /workspace/signals/inbox.txt for new instructions:
     [ -s /workspace/signals/inbox.txt ] && cat /workspace/signals/inbox.txt && truncate -s 0 /workspace/signals/inbox.txt
 - If the file has content, read it, acknowledge it, and incorporate it before continuing.
-════════════════════════════════════════════════════════════
+
+SPEC FILE & CONTEXT COMPACTION:
+At the very start, BEFORE any other work, create /workspace/signals/spec.md:
+
+  # Task: ${branch}
+  ## Objective
+  <one-sentence summary of what needs to be done>
+  ## Steps
+  - [ ] Step 1: ...
+  - [ ] Step 2: ...
+  ## Progress Notes
+  <leave blank initially>
+
+After completing each step: check it off ([ ] → [x]) and add a brief Progress Notes entry.
+
+If your context window is getting full (many tool calls, long outputs, or you estimate
+fewer than 20 turns remaining):
+1. Check off completed steps and note the next step in spec.md
+2. Commit and push any uncommitted changes
+3. Write the checkpoint signal: printf 'checkpoint' > /workspace/signals/checkpoint
+4. Exit immediately — a fresh session will read your spec and continue.
+${resumeNote ? `\n${resumeNote}` : ""}════════════════════════════════════════════════════════════
 
 Instructions:
 ${branchInstruction}
@@ -298,6 +328,9 @@ ${branchInstruction}
     if (process.env.CUSTOM_CA_CERT) {
       dockerArgs.push("-e", `CUSTOM_CA_CERT=${process.env.CUSTOM_CA_CERT}`);
     }
+
+    // Always mount the persistent signals dir (spec, checkpoint, inbox)
+    dockerArgs.push("-v", `${signalsDir}:/workspace/signals`);
 
     if (CLAUDE_SKILLS_DIR && existsSync(CLAUDE_SKILLS_DIR)) {
       dockerArgs.push("-v", `${CLAUDE_SKILLS_DIR}:/home/claude-runner/.claude/commands:ro`);
@@ -374,7 +407,7 @@ ${branchInstruction}
     proc.on("close", (code) => {
       const elapsed = ((Date.now() - spawnStart) / 1000).toFixed(0);
       log(`Container exited with code ${code} after ${elapsed}s`);
-      resolve({ exitCode: code, stdout, stderr });
+      resolve({ exitCode: code, stdout, stderr, signalsDir });
     });
 
     proc.on("error", reject);
@@ -441,22 +474,49 @@ async function main() {
     stagingPath = prepareStagingCopy(args.branch.replace(/\//g, "-"));
   }
 
+  const runLabel = `${args.branch.replace(/\//g, "-")}-${Date.now()}`;
+
   try {
-    const result = await runContainer({
-      branch: args.branch,
-      newBranch: args.newBranch,
-      instructions: args.instructions,
-      model: args.model,
-      stagingPath,
-    });
+    let contextResets = 0;
+    let result;
+
+    while (true) {
+      const resumeNote = contextResets > 0
+        ? `RESUMING FROM CONTEXT RESET (session ${contextResets + 1}/${MAX_CONTEXT_RESETS + 1}):\nRead /workspace/signals/spec.md and continue from the first unchecked step. Do NOT redo completed steps.\n`
+        : "";
+
+      result = await runContainer({
+        branch: args.branch,
+        newBranch: args.newBranch,
+        instructions: args.instructions,
+        model: args.model,
+        stagingPath,
+        runLabel,
+        resumeNote,
+      });
+
+      if (result.exitCode !== 0) {
+        log(`Task exited with code ${result.exitCode}.`);
+        break;
+      }
+
+      const checkpointFile = join(result.signalsDir, "checkpoint");
+      if (existsSync(checkpointFile)) {
+        contextResets++;
+        log(`Context checkpoint — reset ${contextResets}/${MAX_CONTEXT_RESETS}`);
+        try { execSync(`rm -f "${checkpointFile}"`, { stdio: "pipe" }); } catch {}
+        if (contextResets >= MAX_CONTEXT_RESETS) {
+          log(`Max context resets (${MAX_CONTEXT_RESETS}) reached — stopping`);
+          break;
+        }
+        continue;
+      }
+
+      log("Task completed successfully.");
+      break;
+    }
 
     rescueUnpushedWork(stagingPath);
-
-    if (result.exitCode === 0) {
-      log("Task completed successfully.");
-    } else {
-      log(`Task exited with code ${result.exitCode}.`);
-    }
   } catch (err) {
     log(`Error: ${err.message}`);
     rescueUnpushedWork(stagingPath);
