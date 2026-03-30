@@ -877,7 +877,7 @@ INBOX (human instructions sent mid-task):
 - If the file has content, read it, acknowledge it in your next response, and incorporate
   the instructions into your current work before continuing.
 
-SPEC FILE & CONTEXT COMPACTION:
+${AGENT_PROVIDER === "codex" ? `SPEC FILE & CONTEXT COMPACTION:
 Your session has a limit of ${MAX_TURNS} turns. At the very start, BEFORE any other work,
 create /workspace/signals/spec.md:
 
@@ -898,11 +898,23 @@ either limit, it will send a CONTEXT WARNING to your inbox. When you receive one
 2. Check it off in spec.md and note what comes next
 3. Commit and push any uncommitted changes
 4. Checkpoint: printf 'checkpoint' > /workspace/signals/checkpoint
-5. Exit immediately
+5. Exit immediately — a fresh session will be spawned with your spec as context
 
-A fresh session will be spawned that reads your spec and resumes from the first
-unchecked step. You can also checkpoint proactively any time you estimate fewer
-than ${Math.ceil(MAX_TURNS * 0.2)} turns remain and you still have steps left.
+You can also checkpoint proactively any time you estimate fewer than
+${Math.ceil(MAX_TURNS * 0.2)} turns remain and you still have steps left.` : `SPEC FILE:
+At the very start, BEFORE any other work, create /workspace/signals/spec.md:
+
+  # Task: ${task.identifier} - ${task.title}
+  ## Objective
+  <one-sentence summary of what needs to be done>
+  ## Steps
+  - [ ] Step 1: ...
+  - [ ] Step 2: ...
+  ## Progress Notes
+  <leave blank initially>
+
+After completing each step: check it off ([ ] → [x]) and add a brief Progress Notes entry.
+Your context window is managed automatically — no need to checkpoint or exit early.`}
 ════════════════════════════════════════════════════════════
 
 Instructions:
@@ -942,7 +954,8 @@ To list PRs: gh pr list`}`;
       "-e", `AGENT_PROVIDER=${AGENT_PROVIDER}`,
       ...(AGENT_PROVIDER === "codex"
         ? ["-e", `OPENAI_API_KEY=${AGENT_API_KEY}`]
-        : ["-e", `ANTHROPIC_API_KEY=${AGENT_API_KEY}`]),
+        : ["-e", `ANTHROPIC_API_KEY=${AGENT_API_KEY}`,
+           "-e", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80"]),
       "-e", `GIT_PROVIDER=${GIT_PROVIDER}`,
       ...(process.env.GIT_USER_NAME ? ["-e", `GIT_USER_NAME=${process.env.GIT_USER_NAME}`] : []),
       ...(process.env.GIT_USER_EMAIL ? ["-e", `GIT_USER_EMAIL=${process.env.GIT_USER_EMAIL}`] : []),
@@ -1050,7 +1063,9 @@ To list PRs: gh pr list`}`;
     const CONTEXT_WARN_TOKENS = Math.floor(160000 * 0.8); // 80% of 200k context window
     const TURN_WARN_THRESHOLD = Math.floor(MAX_TURNS * 0.8);
 
+    // Context warnings only apply to Codex — Claude handles compaction natively
     const sendContextWarning = (reason) => {
+      if (AGENT_PROVIDER !== "codex") return;
       if (contextWarned) return;
       contextWarned = true;
       const msg = `CONTEXT WARNING: ${reason}. Finish your current step, update /workspace/signals/spec.md, commit and push, then checkpoint: printf 'checkpoint' > /workspace/signals/checkpoint`;
@@ -1455,9 +1470,14 @@ async function processTask(task) {
     let contextResets = 0;
 
     while (true) {
-      const resumeNote = contextResets > 0
-        ? `\n\nRESUMING FROM CONTEXT RESET (session ${contextResets + 1}/${MAX_CONTEXT_RESETS + 1}):\nRead /workspace/signals/spec.md for the full spec and your progress so far.\nContinue from the first unchecked step — do NOT redo completed steps.`
-        : "";
+      let resumeNote = "";
+      if (contextResets > 0) {
+        const specPath = join(outcome.signalsDir, "spec.md");
+        const specContent = existsSync(specPath)
+          ? readFileSync(specPath, "utf8")
+          : "(spec file not found — check git log for prior progress)";
+        resumeNote = `\n\nRESUMING FROM CONTEXT RESET (session ${contextResets + 1}/${MAX_CONTEXT_RESETS + 1}):\nContinue from the first unchecked step — do NOT redo completed steps.\n\n${specContent}`;
+      }
 
       outcome = await runInContainer(task, resumeNote);
       lastStagingPath = outcome.stagingPath;
