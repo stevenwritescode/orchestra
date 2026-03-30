@@ -4,7 +4,7 @@ Autonomous coding pipelines that use [Claude Code](https://docs.anthropic.com/en
 
 Set `GIT_PROVIDER=github` or `GIT_PROVIDER=gitlab` — everything else adapts automatically.
 
-Two independent pipelines that can run together or separately:
+Three components that can run together or separately:
 
 ```
                     ┌──────────────────────────────────────────────────┐
@@ -24,6 +24,13 @@ Two independent pipelines that can run together or separately:
                     │    4. Update Linear issue status                 │    or GitHub PRs
                     │    5. Destroy container                          │
                     │                                                  │
+                    ├──────────────────────────────────────────────────┤
+                    │                                                  │
+  You ───────────► │  manual-runner/                                  │
+  (CLI flags or     │    1. Specify branch + instructions              │
+   interactive)     │    2. Spawn sandboxed Docker container      ─────┼──► GitLab MRs
+                    │    3. Claude Code implements + opens MR          │    or GitHub PRs
+                    │                                                  │
                     └──────────────────────────────────────────────────┘
 ```
 
@@ -38,6 +45,25 @@ An Express API receives bug reports from your website. Each report goes through 
 
 A webhook listener catches review comments (from humans or [CodeRabbit](https://coderabbit.ai/)) and triggers Claude Code revision sessions to address feedback, pushing new commits until approved or a round limit is hit. Supports both GitLab (`/webhook/gitlab`) and GitHub (`/webhook/github`) webhook formats.
 
+See [`bug-fixer/README.md`](bug-fixer/README.md) for full setup.
+
+### Pipeline 3: Manual → Implement → MR/PR ([`manual-runner/`](manual-runner/))
+
+Spin up a sandboxed Claude Code container on demand with your own instructions. Same Docker isolation as the linear-task-runner, but you drive it manually via CLI flags or interactive prompts.
+
+```bash
+# Check out an existing branch
+node manual-runner/run.mjs -b feature/auth -i "Add unit tests for the auth middleware"
+
+# Create a new branch
+node manual-runner/run.mjs -nb fix/login-bug -i "The login button doesn't work on Firefox"
+
+# Interactive mode
+node manual-runner/run.mjs
+```
+
+See [`manual-runner/README.md`](manual-runner/README.md) for full usage.
+
 ### Pipeline 2: Linear → Implement → MR/PR ([`linear-task-runner/`](linear-task-runner/))
 
 An orchestrator polls Linear for issues with a specific label (default: `autofix`). For each task:
@@ -48,6 +74,8 @@ An orchestrator polls Linear for issues with a specific label (default: `autofix
 4. Container is destroyed — no state leakage between tasks
 
 Docker sandboxing makes `--dangerously-skip-permissions` safe: filesystem isolation, iptables firewall (whitelist only), non-root user, resource limits, no host Docker socket access.
+
+See [`linear-task-runner/README.md`](linear-task-runner/README.md) for full setup and mid-task messaging.
 
 ## Backend testing
 
