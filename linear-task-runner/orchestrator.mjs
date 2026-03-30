@@ -20,7 +20,7 @@ import { existsSync, mkdirSync, cpSync, readFileSync, writeFileSync, readdirSync
 import { join, dirname } from "path";
 import { fileURLToPath, pathToFileURL } from "url";
 import { loadEnv } from "./lib/env.mjs";
-import { getClaudeOAuthToken } from "./lib/auth.mjs";
+import { resolveAgentAuth } from "./lib/auth.mjs";
 import { buildSkillsPromptSection } from "./lib/skills.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -43,17 +43,12 @@ try {
 const LINEAR_API_KEY = process.env.LINEAR_API_KEY || "";
 const LINEAR_AUTH_MODE = LINEAR_API_KEY ? "api-key" : "oauth";
 
-// Auth priority: ANTHROPIC_API_KEY env var → Claude Code OAuth login
-let ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "";
-let ANTHROPIC_AUTH_MODE = "api-key";
-
-if (!ANTHROPIC_API_KEY) {
-  const oauthToken = getClaudeOAuthToken();
-  if (oauthToken) {
-    ANTHROPIC_API_KEY = oauthToken;
-    ANTHROPIC_AUTH_MODE = "oauth";
-  }
-}
+// Agent provider: "claude" (default) or "codex" (OpenAI)
+const AGENT = resolveAgentAuth(log);
+const AGENT_PROVIDER = AGENT.provider;
+const AGENT_API_KEY = AGENT.apiKey;
+const CODEX_MODEL = process.env.CODEX_MODEL || "o3";
+const CODEX_AUTH_JSON = AGENT.codexAuthJson;
 const GIT_PROVIDER = process.env.GIT_PROVIDER || "gitlab";
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN || "";
 const GITHUB_REPO = process.env.GITHUB_REPO || "";
@@ -161,16 +156,7 @@ const LINEAR_LABEL = process.env.LINEAR_LABEL || "autofix";
 const LINEAR_STATUS_RAW = process.env.LINEAR_STATUS || "Todo";
 const LINEAR_STATUSES = LINEAR_STATUS_RAW.split(",").map((s) => s.trim()).filter(Boolean);
 
-if (!ANTHROPIC_API_KEY) {
-  console.error("No Anthropic credentials found. Either:");
-  console.error("  1. Set ANTHROPIC_API_KEY in .env  (works on all platforms)");
-  console.error("  2. Log in with: claude login  (macOS/Linux)");
-  if (process.platform === "win32") {
-    console.error("  3. Windows: install CredentialManager module and log in with claude login:");
-    console.error("     Install-Module CredentialManager -Scope CurrentUser");
-  }
-  process.exit(1);
-}
+// Agent auth already validated by resolveAgentAuth()
 if (GIT_PROVIDER === "github" && (!GITHUB_TOKEN || !GITHUB_REPO)) {
   console.error("Missing required env vars for GitHub: GITHUB_TOKEN, GITHUB_REPO");
   process.exit(1);
@@ -915,9 +901,10 @@ To list PRs: gh pr list`}`;
       "--rm",
       "--name", containerName,
       "--cap-add=NET_ADMIN",
-      // Pass Anthropic credentials — OAuth tokens from Claude Code login
-      // work as API keys (sk-ant-oat01-... format)
-      "-e", `ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}`,
+      "-e", `AGENT_PROVIDER=${AGENT_PROVIDER}`,
+      ...(AGENT_PROVIDER === "codex"
+        ? ["-e", `OPENAI_API_KEY=${AGENT_API_KEY}`]
+        : ["-e", `ANTHROPIC_API_KEY=${AGENT_API_KEY}`]),
       "-e", `GIT_PROVIDER=${GIT_PROVIDER}`,
       ...(process.env.GIT_USER_NAME ? ["-e", `GIT_USER_NAME=${process.env.GIT_USER_NAME}`] : []),
       ...(process.env.GIT_USER_EMAIL ? ["-e", `GIT_USER_EMAIL=${process.env.GIT_USER_EMAIL}`] : []),
@@ -965,6 +952,15 @@ To list PRs: gh pr list`}`;
       dockerArgs.push("-v", `${CLAUDE_SKILLS_DIR}:/home/claude-runner/.claude/commands:ro`);
     }
 
+    // For Codex OAuth: mount auth.json so codex exec can authenticate
+    if (AGENT_PROVIDER === "codex" && CODEX_AUTH_JSON) {
+      const codexAuthDir = join(STAGING_DIR, `codex-auth-${containerName}`);
+      mkdirSync(codexAuthDir, { recursive: true });
+      writeFileSync(join(codexAuthDir, "auth.json"), JSON.stringify(CODEX_AUTH_JSON, null, 2));
+      execSync(`chmod -R 777 "${codexAuthDir}"`, { stdio: "pipe" });
+      dockerArgs.push("-v", `${codexAuthDir}:/home/claude-runner/.codex:rw`);
+    }
+
     // Live backend access: let the agent reach the backend on the host
     if (BACKEND_LIVE_ACCESS) {
       // --add-host ensures host.docker.internal resolves on Linux too
@@ -983,19 +979,31 @@ To list PRs: gh pr list`}`;
       );
     }
 
-    dockerArgs.push(
-      DOCKER_IMAGE,
-      "claude", "-p", prompt,
-      "--dangerously-skip-permissions",
-      "--model", CLAUDE_MODEL,
-      "--max-turns", String(MAX_TURNS),
-      "--verbose",
-      "--output-format", "stream-json",
-    );
+    if (AGENT_PROVIDER === "codex") {
+      dockerArgs.push(
+        DOCKER_IMAGE,
+        "codex", "exec",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--model", CODEX_MODEL,
+        "--json",
+        "--ephemeral",
+        prompt,
+      );
+    } else {
+      dockerArgs.push(
+        DOCKER_IMAGE,
+        "claude", "-p", prompt,
+        "--dangerously-skip-permissions",
+        "--model", CLAUDE_MODEL,
+        "--max-turns", String(MAX_TURNS),
+        "--verbose",
+        "--output-format", "stream-json",
+      );
+    }
 
     const spawnStart = Date.now();
     log(`[${task.identifier}] Spawning container: ${containerName}`);
-    log(`[${task.identifier}] Auth mode: ${ANTHROPIC_AUTH_MODE}`);
+    log(`[${task.identifier}] Agent: ${AGENT_PROVIDER} (${AGENT.authMode})`);
     if (LOCAL_REPO_PATH) {
       log(`[${task.identifier}] Using local repo: ${LOCAL_REPO_PATH} → staging: ${stagingPath}`);
     }
@@ -1018,16 +1026,26 @@ To list PRs: gh pr list`}`;
         if (!line.trim()) continue;
         try {
           const event = JSON.parse(line);
-          if (event.type === "assistant" && event.message?.content) {
-            for (const block of event.message.content) {
-              if (block.type === "text") {
-                log(`[${task.identifier}] Claude: ${block.text.slice(0, 200)}`);
-              } else if (block.type === "tool_use") {
-                log(`[${task.identifier}] Tool: ${block.name}${block.input?.command ? ` → ${block.input.command.slice(0, 100)}` : ""}`);
-              }
+          if (AGENT_PROVIDER === "codex") {
+            if (event.type === "message" && event.message) {
+              log(`[${task.identifier}] Codex: ${event.message.slice(0, 200)}`);
+            } else if (event.type === "function_call" || event.type === "command") {
+              log(`[${task.identifier}] Tool: ${(event.command || event.name || "").slice(0, 150)}`);
+            } else if (event.type === "error") {
+              log(`[${task.identifier}] Error: ${(event.message || event.error || "").slice(0, 200)}`);
             }
-          } else if (event.type === "result") {
-            log(`[${task.identifier}] Result: ${(event.result || "").slice(0, 200)}`);
+          } else {
+            if (event.type === "assistant" && event.message?.content) {
+              for (const block of event.message.content) {
+                if (block.type === "text") {
+                  log(`[${task.identifier}] Claude: ${block.text.slice(0, 200)}`);
+                } else if (block.type === "tool_use") {
+                  log(`[${task.identifier}] Tool: ${block.name}${block.input?.command ? ` → ${block.input.command.slice(0, 100)}` : ""}`);
+                }
+              }
+            } else if (event.type === "result") {
+              log(`[${task.identifier}] Result: ${(event.result || "").slice(0, 200)}`);
+            }
           }
         } catch {
           // not valid JSON line, ignore
@@ -1512,7 +1530,8 @@ async function main() {
   } else {
     log(`GitLab: ${GITLAB_URL} | Project: ${GITLAB_PROJECT_ID}`);
   }
-  log(`Claude auth: ${ANTHROPIC_AUTH_MODE === "oauth" ? "OAuth (from Claude Code login)" : "API key"}`);
+  log(`Agent: ${AGENT_PROVIDER} (${AGENT_PROVIDER === "codex" ? `model: ${CODEX_MODEL}` : `model: ${CLAUDE_MODEL}`})`);
+  log(`Agent auth: ${AGENT.authMode}`);
   log(`Linear auth: ${LINEAR_AUTH_MODE === "api-key" ? "API key" : "OAuth (auto-refreshing)"}`);
   log(`Polling every ${POLL_INTERVAL_MS / 1000}s for issues with label="${LINEAR_LABEL}" status="${LINEAR_STATUSES.join(", ")}"`);
   log(`Model: ${CLAUDE_MODEL} | Max turns: ${MAX_TURNS} | Timeout: ${TASK_TIMEOUT_MS / 1000}s`);

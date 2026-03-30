@@ -130,13 +130,27 @@ if [ -n "${CUSTOM_CA_CERT:-}" ]; then
     fi
 fi
 
-# ─── Install Claude Code CLI ──────────────────────────────────────────────────
+# ─── Install agent CLI ───────────────────────────────────────────────────────
 # Done at runtime (not in Dockerfile) so CUSTOM_CA_CERT is available for npm.
-# Skips if already installed (e.g. image was built with it pre-installed).
-if ! command -v claude &>/dev/null; then
-    echo "[entrypoint] Installing Claude Code CLI..."
-    npm install -g @anthropic-ai/claude-code 2>&1 | tail -3
-    echo "[entrypoint] Claude Code CLI installed."
+# Skips if already installed.
+AGENT_PROVIDER="${AGENT_PROVIDER:-claude}"
+
+if [ "$AGENT_PROVIDER" = "codex" ]; then
+    if ! command -v codex &>/dev/null; then
+        echo "[entrypoint] Installing Codex CLI..."
+        start_timer "Installing Codex CLI"
+        npm install -g @openai/codex 2>&1 | tail -3
+        stop_timer
+        echo "[entrypoint] Codex CLI installed."
+    fi
+else
+    if ! command -v claude &>/dev/null; then
+        echo "[entrypoint] Installing Claude Code CLI..."
+        start_timer "Installing Claude Code CLI"
+        npm install -g @anthropic-ai/claude-code 2>&1 | tail -3
+        stop_timer
+        echo "[entrypoint] Claude Code CLI installed."
+    fi
 fi
 
 # ─── Setup git config ───────────────────────────────────────────────────────
@@ -272,8 +286,13 @@ fi
 # ─── Drop to non-root and execute command ────────────────────────────────────
 # Write a wrapper script so the multi-line prompt doesn't get mangled by su -c.
 WRAPPER=/tmp/run-as-claude.sh
-CLAUDE_BIN=$(which claude 2>/dev/null || echo "")
-CLAUDE_BIN_DIR=$(dirname "$CLAUDE_BIN" 2>/dev/null || echo "")
+if [ "$AGENT_PROVIDER" = "codex" ]; then
+    AGENT_BIN=$(which codex 2>/dev/null || echo "")
+else
+    AGENT_BIN=$(which claude 2>/dev/null || echo "")
+fi
+AGENT_BIN_DIR=$(dirname "$AGENT_BIN" 2>/dev/null || echo "")
+CLAUDE_BIN_DIR="$AGENT_BIN_DIR"  # keep compat with existing WRAPPER_HEAD
 cat > "$WRAPPER" <<WRAPPER_HEAD
 #!/bin/bash
 export PATH="${CLAUDE_BIN_DIR}:${PATH}"
@@ -281,7 +300,7 @@ cd /workspace/repo || exit 1
 WRAPPER_HEAD
 
 # Pass through all env vars the command needs
-for var in NODE_EXTRA_CA_CERTS ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY GITHUB_TOKEN GH_TOKEN GITLAB_TOKEN; do
+for var in NODE_EXTRA_CA_CERTS ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY OPENAI_API_KEY GITHUB_TOKEN GH_TOKEN GITLAB_TOKEN; do
     eval "val=\${${var}:-}"
     if [ -n "$val" ]; then
         echo "export ${var}='${val}'" >> "$WRAPPER"

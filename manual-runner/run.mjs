@@ -22,7 +22,7 @@ import { join, dirname } from "path";
 import { fileURLToPath, pathToFileURL } from "url";
 import { createInterface } from "readline";
 import { loadEnv } from "../linear-task-runner/lib/env.mjs";
-import { getClaudeOAuthToken } from "../linear-task-runner/lib/auth.mjs";
+import { resolveAgentAuth } from "../linear-task-runner/lib/auth.mjs";
 import { buildSkillsPromptSection } from "../linear-task-runner/lib/skills.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -56,18 +56,11 @@ function log(msg) {
 }
 
 
-let ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "";
-if (!ANTHROPIC_API_KEY) {
-  const oauthToken = getClaudeOAuthToken();
-  if (oauthToken) ANTHROPIC_API_KEY = oauthToken;
-}
-
-if (!ANTHROPIC_API_KEY) {
-  console.error("No Anthropic credentials found. Either:");
-  console.error("  1. Set ANTHROPIC_API_KEY in .env or linear-task-runner/.env");
-  console.error("  2. Log in with: claude login");
-  process.exit(1);
-}
+const AGENT = resolveAgentAuth(log);
+const AGENT_PROVIDER = AGENT.provider;
+const AGENT_API_KEY = AGENT.apiKey;
+const CODEX_MODEL = process.env.CODEX_MODEL || "o3";
+const CODEX_AUTH_JSON = AGENT.codexAuthJson;
 
 if (!LOCAL_REPO_PATH && !REPO_URL) {
   console.error("Set LOCAL_REPO_PATH or REPO_URL in .env");
@@ -77,7 +70,8 @@ if (!LOCAL_REPO_PATH && !REPO_URL) {
 // ─── Parse CLI arguments ────────────────────────────────────────────────────
 function parseArgs() {
   const args = process.argv.slice(2);
-  const parsed = { branch: "", instructions: "", model: CLAUDE_MODEL, interactive: false, newBranch: false };
+  const defaultModel = AGENT_PROVIDER === "codex" ? CODEX_MODEL : CLAUDE_MODEL;
+  const parsed = { branch: "", instructions: "", model: defaultModel, interactive: false, newBranch: false };
 
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
@@ -267,7 +261,10 @@ ${branchInstruction}
       "run", "--rm",
       "--name", containerName,
       "--cap-add=NET_ADMIN",
-      "-e", `ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}`,
+      "-e", `AGENT_PROVIDER=${AGENT_PROVIDER}`,
+      ...(AGENT_PROVIDER === "codex"
+        ? ["-e", `OPENAI_API_KEY=${AGENT_API_KEY}`]
+        : ["-e", `ANTHROPIC_API_KEY=${AGENT_API_KEY}`]),
       "-e", `GIT_PROVIDER=${GIT_PROVIDER}`,
       ...(process.env.GIT_USER_NAME ? ["-e", `GIT_USER_NAME=${process.env.GIT_USER_NAME}`] : []),
       ...(process.env.GIT_USER_EMAIL ? ["-e", `GIT_USER_EMAIL=${process.env.GIT_USER_EMAIL}`] : []),
@@ -306,18 +303,39 @@ ${branchInstruction}
       dockerArgs.push("-v", `${CLAUDE_SKILLS_DIR}:/home/claude-runner/.claude/commands:ro`);
     }
 
-    dockerArgs.push(
-      DOCKER_IMAGE,
-      "claude", "-p", prompt,
-      "--dangerously-skip-permissions",
-      "--model", model,
-      "--max-turns", String(MAX_TURNS),
-      "--verbose",
-      "--output-format", "stream-json",
-    );
+    // For Codex OAuth: mount auth.json
+    if (AGENT_PROVIDER === "codex" && CODEX_AUTH_JSON) {
+      const codexAuthDir = join(STAGING_DIR, `codex-auth-${containerName}`);
+      mkdirSync(codexAuthDir, { recursive: true });
+      writeFileSync(join(codexAuthDir, "auth.json"), JSON.stringify(CODEX_AUTH_JSON, null, 2));
+      execSync(`chmod -R 777 "${codexAuthDir}"`, { stdio: "pipe" });
+      dockerArgs.push("-v", `${codexAuthDir}:/home/claude-runner/.codex:rw`);
+    }
+
+    if (AGENT_PROVIDER === "codex") {
+      dockerArgs.push(
+        DOCKER_IMAGE,
+        "codex", "exec",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--model", model === CLAUDE_MODEL ? CODEX_MODEL : model,
+        "--json",
+        "--ephemeral",
+        prompt,
+      );
+    } else {
+      dockerArgs.push(
+        DOCKER_IMAGE,
+        "claude", "-p", prompt,
+        "--dangerously-skip-permissions",
+        "--model", model,
+        "--max-turns", String(MAX_TURNS),
+        "--verbose",
+        "--output-format", "stream-json",
+      );
+    }
 
     log(`Spawning container: ${containerName}`);
-    log(`Branch: ${branch} (${newBranch ? "new" : "existing"})`);
+    log(`Agent: ${AGENT_PROVIDER} | Branch: ${branch} (${newBranch ? "new" : "existing"})`);
     log(`Model: ${model} | Max turns: ${MAX_TURNS} | Timeout: ${TASK_TIMEOUT_MS / 1000}s`);
 
     let stdout = "";
