@@ -1,6 +1,6 @@
 # Manual Runner
 
-Spin up a sandboxed Claude Code container to work on any branch with custom instructions. Like the linear-task-runner, but you drive it manually.
+Spin up a sandboxed agent container to work on any branch with custom instructions. Like the linear-task-runner, but you drive it manually. Supports Claude Code and OpenAI Codex via `AGENT_PROVIDER`.
 
 ## Usage
 
@@ -26,7 +26,7 @@ node run.mjs  # (same — interactive if no args)
 | `--branch` | `-b` | Existing branch to check out |
 | `--new-branch` | `-nb` | Create a new branch from main |
 | `--instructions` | `-i` | What to work on |
-| `--model` | `-m` | Claude model (default: sonnet) |
+| `--model` | `-m` | Agent model (default: sonnet) |
 | `--interactive` | | Prompt for input |
 | `--help` | `-h` | Show help |
 
@@ -36,4 +36,15 @@ Reads from `.env` in this directory, then falls back to `linear-task-runner/.env
 
 ## Auth
 
-Same as the linear-task-runner — uses `ANTHROPIC_API_KEY` from `.env`, or falls back to your Claude Code OAuth login (`claude login`).
+Set `AGENT_PROVIDER` in `.env` to choose your agent:
+
+| Provider | `AGENT_PROVIDER` | Auth |
+|----------|-----------------|------|
+| Claude Code (default) | `claude` | `ANTHROPIC_API_KEY` or `claude login` |
+| OpenAI Codex | `codex` | `OPENAI_API_KEY` or `codex login` |
+
+On macOS, OAuth tokens are read from the system Keychain automatically if no API key is set. On other platforms, the credentials file from the agent's login is used.
+
+## Claude Skills
+
+Set `CLAUDE_SKILLS_DIR` in `.env` to a directory of markdown skill files. Relevant skills are injected into the agent's context automatically based on keyword matching against your instructions.
