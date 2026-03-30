@@ -77,6 +77,42 @@ Host Machine
 - Use protected branches to prevent pushes to main
 - Review all MRs before merging
 
+## Sending Instructions to a Running Container
+
+You can redirect or add context to Claude mid-task without restarting the container.
+
+### List active tasks
+
+```bash
+node send.mjs --list
+# Active tasks:
+#   F2-46  container: task-f2-46-a1b2c3d4  started: 2026-03-30T14:22:00.000Z
+#   F2-45  container: task-f2-45-e5f6g7h8  started: 2026-03-30T14:23:00.000Z
+```
+
+### Send a message
+
+```bash
+node send.mjs <task-id> "<message>"
+```
+
+Examples:
+
+```bash
+# Redirect focus
+node send.mjs F2-46 "Skip the migration for now, handle it in a follow-up ticket"
+
+# Add context
+node send.mjs F2-46 "The billing API changed last week — use BillingClientV2 not BillingClient"
+
+# Inject a file
+node send.mjs F2-46 "$(cat extra-context.md)"
+```
+
+The message is written to `/workspace/signals/inbox.txt` inside the container via `docker exec`. Claude checks this file before each major step, acknowledges the message, and incorporates the instructions before continuing. The file is cleared after reading so each message is only acted on once.
+
+**Note:** The task must have been started with a recent version of orchestra for the container name to be tracked. Older runs won't appear in `--list`.
+
 ## GitLab-Specific Details
 
 ### Authentication
